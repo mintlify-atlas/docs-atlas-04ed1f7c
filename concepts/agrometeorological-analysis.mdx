@@ -1,0 +1,150 @@
+---
+title: "ERA5 Climate Data Ingestion and ENSO Analysis"
+sidebarTitle: "Climate Analysis"
+description: "How AGRO-JUTIAPA fetches and processes 45 years of ERA5 reanalysis data from Open-Meteo and ENSO indices from NOAA PSL for Jutiapa, Guatemala."
+---
+
+AGRO-JUTIAPA's data pipeline forms the observational backbone of every sowing recommendation produced for Calderas, San José Acatempa, Jutiapa. On each analysis request the system fetches a continuous daily series of ERA5 satellite reanalysis data from 1981 to the present via the Open-Meteo Archive API, merges it with global macro-climate ENSO indices sourced from the NOAA Physical Sciences Laboratory, and derives a rich set of agrometeorological features before training or querying the calibrated ML models. Every step is reproducible, open-access, and requires no API key or authentication.
+
+## ERA5 Variables
+
+AGRO-JUTIAPA ingests three daily ERA5 variables for the fixed coordinates of Calderas (lat `14.267`, lon `-90.133`) since `start_year = 1981`:
+
+| Raw API Field | Renamed Column | Description |
+|---|---|---|
+| `precipitation_sum` | `precip_mm` | Daily accumulated precipitation (mm) |
+| `et0_fao_evapotranspiration` | `et0_mm` | Penman-Monteith reference ET₀ (mm/day) |
+| `temperature_2m_mean` | `t_mean_c` | Mean daily air temperature at 2 m height (°C) |
+
+The fetcher downloads data in **10-year rolling chunks** to stay within the Open-Meteo rate limits, concatenates them, and enforces three physical integrity assertions before any downstream computation:
+
+```python
+# From core/data_fetcher.py — physical integrity checks
+assert df[core].notna().all().all(), "Huecos internos en la serie meteorológica descargada."
+assert (df["time"].diff().dropna() == pd.Timedelta(days=1)).all(), "Serie con días faltantes en secuencia."
+assert df["precip_mm"].between(0, 600).all() and df["et0_mm"].between(0, 20).all(), "Valores físicos fuera de rango."
+```
+
+These checks guarantee that no internal gaps exist in the time series, that all calendar days are present, and that precipitation and ET₀ values fall within physically plausible ranges before the balance simulation begins.
+
+<Note>
+  The archive endpoint is `https://archive-api.open-meteo.com/v1/archive` and all timestamps are aligned to the `America/Guatemala` timezone (UTC−6, no daylight saving time). This avoids off-by-one day errors common in tropical reanalysis workflows.
+</Note>
+
+## ENSO Macro-Climate Indices
+
+Alongside the local ERA5 series, the pipeline downloads two monthly ENSO indices directly from NOAA PSL:
+
+| Index | NOAA PSL URL | Description |
+|---|---|---|
+| `mei_v2` | `https://psl.noaa.gov/data/correlation/meiv2.data` | Multivariate ENSO Index v2 (MEI v2) |
+| `nino34_anom` | `https://psl.noaa.gov/data/timeseries/month/data/nino34.long.anom.data` | Niño 3.4 sea-surface temperature anomaly |
+
+**ENSO phases** are classified by the MEI v2 value at each monthly timestep:
+
+<Tabs>
+  <Tab title="El Niño">
+    MEI v2 ≥ **0.5** — Anomalously warm eastern Pacific. Associated with reduced rainfall in the Guatemalan Dry Corridor and elevated drought risk for white maize.
+  </Tab>
+  <Tab title="La Niña">
+    MEI v2 ≤ **−0.5** — Anomalously cool eastern Pacific. Associated with increased or erratic precipitation and potential waterlogging events in Jutiapa.
+  </Tab>
+  <Tab title="Neutral">
+    **−0.5 < MEI v2 < 0.5** — Baseline climatological conditions. No strong ENSO forcing signal; local rainfall patterns dominate.
+  </Tab>
+</Tabs>
+
+To prevent **lookahead bias** (using future ENSO values to predict a past sowing outcome), the pipeline constructs two lag features from the raw monthly MEI series:
+
+```python
+# From core/data_fetcher.py — rigorous lag construction
+df["mei_lag1"]  = df["mei_v2"].shift(1)            # MEI of the previous month
+df["mei_trend"] = df["mei_lag1"] - df["mei_v2"].shift(2)  # Month-over-month change
+df["nino34_lag1"] = df["nino34_anom"].shift(1)      # Niño 3.4 of the previous month
+```
+
+Only `mei_lag1` and `mei_trend` are exposed to the ML models as ENSO features; raw current-month values are never used as predictors.
+
+## Caching Strategy
+
+Both the ERA5 weather series and the processed ENSO indices are written to a local `.cache/` directory on first download and reloaded from disk on subsequent runs. This design protects the Open-Meteo and NOAA rate quotas and makes the pipeline deterministic in offline environments.
+
+<Accordion title="Cache file naming convention">
+  Weather files are named `weather_{lat:.3f}_{lon:.3f}_{start_year}.csv`, for example `weather_14.267_-90.133_1981.csv`. The ENSO file is always saved as `macro_enso_indices.csv`. Both reside in the `PathConfig.cache_dir` directory, which defaults to `<project_root>/.cache/`.
+</Accordion>
+
+The `fetch_weather()` and `fetch_macro()` functions both accept two boolean flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `use_cache` | `True` | Load from `.cache/` if the file exists; skip download |
+| `force_refresh` | `False` | Delete and re-download even if a cached file is present |
+
+HTTP requests are protected by an **exponential backoff** retry loop that handles HTTP 429 rate-limit responses from Open-Meteo:
+
+```python
+# From core/data_fetcher.py — exponential backoff on HTTP 429
+def _get_json_with_retry(url, params, retries=5, initial_backoff=5.0):
+    backoff = initial_backoff
+    for attempt in range(1, retries + 1):
+        response = requests.get(url, params=params, timeout=90)
+        if response.status_code == 429:
+            wait_time = backoff * attempt
+            time.sleep(wait_time)
+            continue
+        response.raise_for_status()
+        return response.json()
+```
+
+The timeout is set to **90 seconds** per chunk request to accommodate slow NOAA PSL text endpoints.
+
+## Feature Engineering
+
+After the raw ERA5 and ENSO series are merged, `build_dataset()` in `core/soil_balance.py` derives the full feature matrix. Features are grouped into two sets defined in `MacroClimateConfig`:
+
+<CardGroup cols={2}>
+  <Card title="Local Features (features_local)" icon="cloud-rain">
+    Climate and soil features that can be computed from ERA5 alone — no ENSO data required.
+
+    - `precip_acc_15d` — Rolling 15-day precipitation sum (mm)
+    - `precip_acc_30d` — Rolling 30-day precipitation sum (mm)
+    - `balance_hidrico_30d` — 30-day water balance (precip − ET₀, mm)
+    - `humedad_suelo_frac` — Antecedent soil moisture fraction from the fallow bucket model (0–1)
+    - `dry_spell_len` — Current consecutive-dry-day streak (days with `precip_mm < 1.5`)
+    - `doy_sin` — Cyclical sine encoding of day-of-year: `sin(2π × doy / 365.25)`
+    - `doy_cos` — Cyclical cosine encoding of day-of-year: `cos(2π × doy / 365.25)`
+  </Card>
+  <Card title="ENSO Features (features_enso)" icon="globe">
+    Macro-climate indices that capture inter-annual variability from the Pacific Ocean.
+
+    - `mei_lag1` — Multivariate ENSO Index v2, one month before the sowing date
+    - `mei_trend` — Month-over-month change in MEI v2 (acceleration/deceleration)
+
+    These two features are appended to the local set to produce `features_full`, the complete input vector for the `XGBoost local+ENSO` and `Logística local+ENSO` model configurations.
+  </Card>
+</CardGroup>
+
+The **cyclical day-of-year encoding** (`doy_sin` / `doy_cos`) preserves the circular continuity of the annual calendar — December 31 and January 1 are numerically adjacent — which linear day-of-year integers cannot represent. The **dry spell counter** resets to zero on any day with ≥ 1.5 mm of precipitation, matching the agronomic definition of an effective rain event used throughout the FAO-56 framework.
+
+## GeoConfig Dataclass
+
+The geographic and API parameters for Calderas are frozen in the `GeoConfig` dataclass in `config/settings.py`:
+
+```python
+# From config/settings.py
+@dataclass(frozen=True)
+class GeoConfig:
+    lat: float = 14.267                  # Latitude — Calderas, San José Acatempa
+    lon: float = -90.133                 # Longitude
+    start_year: int = 1981               # ERA5 series start year
+    timezone: str = "America/Guatemala"  # UTC-6, no DST
+    municipality: str = "Calderas, San José Acatempa, Jutiapa (Guatemala)"
+    archive_url: str = "https://archive-api.open-meteo.com/v1/archive"
+    daily_vars: Tuple[str, ...] = (
+        "precipitation_sum",
+        "et0_fao_evapotranspiration",
+        "temperature_2m_mean",
+    )
+```
+
+All fields are immutable (`frozen=True`). Changing coordinates for a different locality requires instantiating a new `GeoConfig` object and passing it to `fetch_weather()` — the cache key is automatically updated to reflect the new `lat`, `lon`, and `start_year`.

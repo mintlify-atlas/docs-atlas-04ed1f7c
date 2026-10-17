@@ -1,0 +1,357 @@
+---
+title: "Terrain Modeling, Sowing Density, and Financial Projection"
+sidebarTitle: "Agronomy & Economics"
+description: "core/agronomy_economics.py provides TerrainModel for parcel geometry, calculate_sowing_density() for plant population, and calculate_financial_projection() for P&L analysis."
+---
+
+`core/agronomy_economics.py` covers the agronomic and economic layer of the AGRO-JUTIAPA platform. It handles three distinct concerns: (1) **terrain geometry** — computing parcel area in both metric and traditional Guatemalan units from any field measurement method; (2) **sowing density** — deriving risk-adjusted plant population, seed requirements, and row spacing from the traffic-light verdict; and (3) **financial projection** — building a complete profit-and-loss statement using official MAGA maize prices without inventing budget line items the farmer did not provide.
+
+---
+
+## `TerrainModel` Dataclass
+
+`TerrainModel` represents the geometric shape of the agricultural parcel. It supports four shape types commonly encountered during field surveys by MAGA extensionists in Jutiapa.
+
+```python
+@dataclass
+class TerrainModel:
+    shape_type: str = "rectangulo"
+    ancho_m: float = 100.0
+    largo_m: float = 70.0
+    sides: List[float] = field(default_factory=lambda: [100.0, 70.0, 100.0, 70.0])
+    custom_coords: Optional[List[Tuple[float, float]]] = None
+```
+
+<ParamField path="shape_type" type="str" default='"rectangulo"'>
+  Geometry type. Accepted values:
+
+  - `"rectangulo"` — standard rectangular parcel; uses `ancho_m × largo_m`.
+  - `"cuadrilatero"` — irregular quadrilateral with four unequal sides; uses the standard Guatemalan field-survey approximation.
+  - `"triangulo"` — three-sided plot; uses Heron's formula.
+  - `"poligono"` — arbitrary polygon defined by `custom_coords`; uses the Gauss / Shoelace formula.
+</ParamField>
+
+<ParamField path="ancho_m" type="float" default="100.0">
+  Parcel width in metres. For `"cuadrilatero"`, this is recomputed as the average of sides 0 and 2 by `__post_init__`.
+</ParamField>
+
+<ParamField path="largo_m" type="float" default="70.0">
+  Parcel length in metres. For `"cuadrilatero"`, this is recomputed as the average of sides 1 and 3.
+</ParamField>
+
+<ParamField path="sides" type="List[float]" default="[100.0, 70.0, 100.0, 70.0]">
+  Side lengths in metres. Interpretation depends on `shape_type`:
+  - `"rectangulo"`: `[width, length, width, length]`
+  - `"cuadrilatero"`: `[S_sur, S_este, S_norte, S_oeste]` (four unequal sides)
+  - `"triangulo"`: `[a, b, c]`
+</ParamField>
+
+<ParamField path="custom_coords" type="Optional[List[Tuple[float, float]]]" default="None">
+  List of `(x, y)` vertex coordinates in metres for `"poligono"` parcels. Only used when `shape_type == "poligono"`.
+</ParamField>
+
+### Area Calculation Formulas
+
+The `area_m2` property applies different formulas depending on `shape_type`:
+
+<CodeGroup>
+```python Rectangulo
+# Standard rectangle
+area = ancho_m * largo_m
+```
+
+```python Cuadrilatero
+# Irregular quadrilateral — standard Guatemalan MAGA field-survey technique
+# sides = [a (Sur), b (Este), c (Norte), d (Oeste)]
+a, b, c, d = sides[0], sides[1], sides[2], sides[3]
+area = ((a + c) / 2.0) * ((b + d) / 2.0)
+```
+
+```python Triangulo
+# Heron's formula from three sides
+a, b, c = sides[0], sides[1], sides[2]
+s = (a + b + c) / 2.0
+area = math.sqrt(s * (s - a) * (s - b) * (s - c))
+```
+
+```python Poligono
+# Gauss / Shoelace formula from vertex coordinates
+pts = custom_coords
+n = len(pts)
+area = 0.0
+for i in range(n):
+    j = (i + 1) % n
+    area += pts[i][0] * pts[j][1]
+    area -= pts[j][0] * pts[i][1]
+area = abs(area) / 2.0
+```
+</CodeGroup>
+
+<Note>
+  The cuadrilátero approximation `((a+c)/2) × ((b+d)/2)` is the standard technique used by MAGA field extensionists across Guatemala for irregular four-sided plots. It is accurate for nearly-rectangular parcels; for highly skewed quadrilaterals, use the `"poligono"` type with surveyed vertex coordinates.
+</Note>
+
+### Properties
+
+<ResponseField name="area_m2" type="float">
+  Parcel area in square metres, computed from the appropriate geometric formula.
+</ResponseField>
+
+<ResponseField name="manzanas" type="float">
+  Area in Guatemalan manzanas: `area_m2 / 7000.0`. One manzana equals exactly 7,000 m² (or 10,000 varas²) in the traditional Guatemalan measurement system used by MAGA.
+</ResponseField>
+
+<ResponseField name="hectareas" type="float">
+  Area in hectares: `area_m2 / 10000.0`.
+</ResponseField>
+
+<ResponseField name="perimetro_m" type="float">
+  Total perimeter in metres. Computed as the sum of all sides or, for polygons, the sum of Euclidean distances between consecutive vertices.
+</ResponseField>
+
+<ResponseField name="descripcion_forma" type="str">
+  Human-readable shape description, e.g. `"Cuadrilátero Irregular - 100m, 70m, 90m, 65m"` or `"Rectangular - 100m × 70m"`.
+</ResponseField>
+
+### `get_polygon_vertices()` Method
+
+```python
+def get_polygon_vertices(self) -> List[Tuple[float, float]]
+```
+
+Returns the 2D vertex coordinates `(x, y)` in metres for rendering in a Canvas (web UI) or Matplotlib (PDF) diagram. For `"rectangulo"` this produces four corners starting at the origin; for `"triangulo"` the law of cosines is used to compute the third vertex from the three side lengths; for `"cuadrilatero"` an approximate trapezoidal layout is constructed.
+
+---
+
+## `calculate_sowing_density()` Function
+
+```python
+def calculate_sowing_density(
+    terrain: TerrainModel,
+    viability_prob: float,
+    semaforo_color: str,
+) -> Dict[str, Any]
+```
+
+Derives the risk-adjusted plant population and seed procurement requirements for the parcel. The density per square metre is calibrated to the traffic-light colour to match water availability with competitive demand for soil moisture.
+
+<ParamField path="terrain" type="TerrainModel">
+  Instantiated terrain model from which `area_m2` is read.
+</ParamField>
+
+<ParamField path="viability_prob" type="float">
+  Calibrated viability probability from the pipeline (0–1). Used for documentation in the output but the primary density selector is `semaforo_color`.
+</ParamField>
+
+<ParamField path="semaforo_color" type="str">
+  Traffic-light colour. Determines the density regime applied:
+
+  | Color    | Plants/m² | Row spacing (cm) | Post spacing (cm) | Rationale |
+  |----------|-----------|------------------|-------------------|-----------|
+  | Verde    | 5.8       | 80               | 22                | Optimal water regime supports maximum population |
+  | Amarillo | 4.4       | 85               | 27                | Reduced density to limit root competition for moisture |
+  | Rojo     | 3.6       | 90               | 31                | Wide spacing for survival under severe drought risk |
+</ParamField>
+
+**Germination and survival factors applied:**
+
+- Germination power: **88 %** — proportion of seeds that successfully germinate under field conditions.
+- Field survival: **92 %** — proportion of germinated seedlings that survive to establishment.
+- Combined seed safety factor: `1 / (0.88 × 0.92) ≈ 1.235` — applied to the target plant count to determine total seeds needed.
+
+**Returns:** `Dict[str, Any]` with the following keys:
+
+<ResponseField name="densidad_plantas_m2" type="float">
+  Target plant density per square metre (5.8, 4.4, or 3.6).
+</ResponseField>
+
+<ResponseField name="densidad_plantas_mz" type="int">
+  Equivalent plant density per manzana (`densidad_plantas_m2 × 7000`).
+</ResponseField>
+
+<ResponseField name="plantas_totales_predio" type="int">
+  Total target plant count for the entire parcel.
+</ResponseField>
+
+<ResponseField name="semillas_totales_requeridas" type="int">
+  Total seeds to purchase, accounting for germination and survival losses.
+</ResponseField>
+
+<ResponseField name="bolsas_comerciales" type="float">
+  Number of standard commercial seed bags needed (1 bag = 60,000 seeds).
+</ResponseField>
+
+<ResponseField name="libras_semilla" type="float">
+  Equivalent seed weight in pounds (1 lb ≈ 1,400 seeds).
+</ResponseField>
+
+<ResponseField name="distancia_surcos_cm" type="float">
+  Recommended inter-row spacing in centimetres.
+</ResponseField>
+
+<ResponseField name="distancia_posturas_cm" type="float">
+  Recommended within-row seed spacing in centimetres.
+</ResponseField>
+
+<ResponseField name="semillas_por_postura" type="int">
+  Seeds per planting hole (always 1 for the calibrated spacing system).
+</ResponseField>
+
+<ResponseField name="diagnostico_densidad" type="str">
+  Agronomic justification text for the chosen density level.
+</ResponseField>
+
+---
+
+## `calculate_financial_projection()` Function
+
+```python
+def calculate_financial_projection(
+    terrain: TerrainModel,
+    viability_prob: float,
+    capital_inversion: float,
+    maga_cfg: MagaPriceConfig = MAGA_CONFIG,
+    tipo_maiz: str = "blanco",
+) -> Dict[str, Any]
+```
+
+Generates the complete financial evaluation using the farmer's stated investment capital and the official MAGA market price. No budget line items are invented or assumed beyond what the user explicitly provides.
+
+<ParamField path="terrain" type="TerrainModel">
+  Used to read `manzanas` for yield and income calculations.
+</ParamField>
+
+<ParamField path="viability_prob" type="float">
+  Calibrated probability in `[0, 1]`. Drives the yield adjustment factor.
+</ParamField>
+
+<ParamField path="capital_inversion" type="float">
+  Total investment in Guatemalan quetzales (Q), as entered by the farmer. Used verbatim as the cost of production.
+</ParamField>
+
+<ParamField path="maga_cfg" type="MagaPriceConfig" default="MAGA_CONFIG">
+  Provides `precio_qq_maiz_blanco` (Q/quintal, live-scraped from MAGA La Terminal) and `rendimiento_base_qq_mz` (65 qq/mz under optimal conditions).
+</ParamField>
+
+<ParamField path="tipo_maiz" type="str" default='"blanco"'>
+  Maize type identifier. Only white maize (`"blanco"`) is currently supported with MAGA price data.
+</ParamField>
+
+### Yield Projection Formula
+
+The projected yield adjusts linearly between 40 % and 100 % of the base yield (65 qq/mz) according to viability probability:
+
+```python
+# At prob=1.0 → 100% of rendimiento_base_qq_mz (no climate penalty)
+# At prob=0.0 → 40% of rendimiento_base_qq_mz (extreme drought)
+factor_rendimiento = 0.40 + (0.60 * clip(viability_prob, 0.0, 1.0))
+rendimiento_qq_mz = maga_cfg.rendimiento_base_qq_mz * factor_rendimiento
+```
+
+### Sensitivity Scenarios
+
+Three fixed scenarios are always computed alongside the projected case:
+
+| Scenario | Yield Factor | Description |
+|----------|-------------|-------------|
+| Optimista | Base × 1.15 | Good rainfall year, +15% above base |
+| Proyectado | Base × `factor_rendimiento` | ML-calibrated climate forecast |
+| Pesimista | Base × 0.45 | Drought / canícula, −55% below base |
+
+**Returns:** `Dict[str, Any]` with the following keys:
+
+<ResponseField name="fuente_oficial_maga" type="str">
+  MAGA source attribution string, e.g. `"MAGA DIPLAN - Precios Diarios (La Terminal)"`.
+</ResponseField>
+
+<ResponseField name="fecha_actualizacion_maga" type="str">
+  Date of the MAGA price data used (e.g. `"09/10/2026"`).
+</ResponseField>
+
+<ResponseField name="precio_maga_qq" type="float">
+  Official MAGA price per quintal of white maize in Q.
+</ResponseField>
+
+<ResponseField name="capital_inversion_q" type="float">
+  Total investment as entered by the user (Q).
+</ResponseField>
+
+<ResponseField name="rendimiento_estimado_qq_mz" type="float">
+  Climate-adjusted yield estimate in quintals per manzana.
+</ResponseField>
+
+<ResponseField name="produccion_total_estimada_qq" type="float">
+  Total projected production in quintals across the entire parcel.
+</ResponseField>
+
+<ResponseField name="ingreso_bruto_q" type="float">
+  Gross revenue: `produccion_total_estimada_qq × precio_maga_qq` (Q).
+</ResponseField>
+
+<ResponseField name="utilidad_neta_q" type="float">
+  Net profit: `ingreso_bruto_q − capital_inversion_q` (Q). Can be negative.
+</ResponseField>
+
+<ResponseField name="roi_pct" type="float">
+  Return on investment: `(utilidad_neta_q / capital_inversion_q) × 100` (%).
+</ResponseField>
+
+<ResponseField name="margen_utilidad_pct" type="float">
+  Profit margin: `(utilidad_neta_q / ingreso_bruto_q) × 100` (%).
+</ResponseField>
+
+<ResponseField name="relacion_beneficio_costo" type="float">
+  Benefit-cost ratio: `ingreso_bruto_q / capital_inversion_q`.
+</ResponseField>
+
+<ResponseField name="punto_equilibrio_qq" type="float">
+  Break-even production in quintals: the harvest volume needed to exactly cover the investment at the current MAGA price.
+</ResponseField>
+
+<ResponseField name="inversion_por_quintal_q" type="float">
+  Investment cost per quintal produced (Q/qq).
+</ResponseField>
+
+<ResponseField name="pnl_items" type="List[Dict]">
+  Structured P&L line items. Each dict contains `"concepto"`, `"monto"` (Q), and `"tipo"` (`"costo"`, `"ingreso"`, or `"resultado"`).
+</ResponseField>
+
+<ResponseField name="escenarios_sensibilidad" type="List[Dict]">
+  Three-row sensitivity table. Each row contains `"Escenario"`, `"Rendimiento (qq/mz)"`, `"Producción Total (qq)"`, `"Ingreso Bruto (Q)"`, `"Utilidad Neta (Q)"`, and `"ROI (%)"`.
+</ResponseField>
+
+---
+
+## Usage Example
+
+```python
+from core.agronomy_economics import TerrainModel, calculate_sowing_density, calculate_financial_projection
+from config.settings import MAGA_CONFIG
+
+terrain = TerrainModel(shape_type="rectangulo", ancho_m=100.0, largo_m=70.0)
+print(f"Area: {terrain.area_m2:,.0f} m² ({terrain.manzanas:.3f} mz)")
+
+density = calculate_sowing_density(terrain, viability_prob=0.72, semaforo_color="Verde")
+print(f"Plants/m²: {density['densidad_plantas_m2']}")
+print(f"Total seeds needed: {density['semillas_totales_requeridas']:,}")
+print(f"Commercial bags: {density['bolsas_comerciales']:.2f}")
+
+financials = calculate_financial_projection(terrain, 0.72, 7200.0, MAGA_CONFIG, "blanco")
+print(f"Yield estimate: {financials['rendimiento_estimado_qq_mz']:.1f} qq/mz")
+print(f"Gross revenue: Q {financials['ingreso_bruto_q']:,.2f}")
+print(f"Net profit: Q {financials['utilidad_neta_q']:,.2f}")
+print(f"ROI: {financials['roi_pct']}%")
+print(f"Break-even: {financials['punto_equilibrio_qq']:.1f} qq")
+```
+
+For an irregular quadrilateral plot (common in Calderas hillside parcels):
+
+```python
+terrain_irr = TerrainModel(
+    shape_type="cuadrilatero",
+    sides=[100.0, 70.0, 90.0, 65.0],  # [Sur, Este, Norte, Oeste]
+)
+print(f"Irregular area: {terrain_irr.area_m2:,.1f} m² ({terrain_irr.manzanas:.3f} mz)")
+print(f"Shape: {terrain_irr.descripcion_forma}")
+print(f"Vertices: {terrain_irr.get_polygon_vertices()}")
+```

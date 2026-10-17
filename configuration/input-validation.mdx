@@ -1,0 +1,241 @@
+---
+title: "Input Validation and Security Hardening"
+sidebarTitle: "Validation"
+description: "AGRO-JUTIAPA's input validator sanitizes all user inputs against SQL injection, XSS, and path traversal, and enforces geographic, financial, and geometric limits for Jutiapa."
+---
+
+Every piece of user-supplied data — sowing dates, GPS coordinates, parcel dimensions, and investment capital — passes through the `validate_and_sanitize()` function in `core/input_validator.py` **before any pipeline computation begins**. The validator combines agronomic domain-knowledge checks (geographic bounding box, financial reasonableness, triangle inequality) with active security hardening (SQL injection, XSS, and path-traversal stripping). If any rule is violated, a descriptive `ValidationError` is raised immediately and no weather data is fetched. Only a successfully returned `ValidatedInput` object reaches the pipeline.
+
+---
+
+## validate_and_sanitize() Function
+
+`validate_and_sanitize()` is the single public entry-point for all input validation. It accepts inputs either as a raw dictionary or as keyword arguments (supporting both English and Spanish parameter aliases for CLI and web interoperability), and returns a fully sanitized, typed `ValidatedInput` dataclass.
+
+**Signature:**
+
+```python
+def validate_and_sanitize(
+    raw_inputs: Optional[Dict[str, Any]] = None,
+    **kwargs
+) -> ValidatedInput
+```
+
+**Key parameters** (accepted as dict keys or keyword arguments):
+
+| Parameter | Aliases | Type | Required | Description |
+|---|---|---|---|---|
+| `sowing_date` | `sowing_date_str`, `date`, `fecha_siembra` | `str` or `date` | ✅ Yes | Sowing date in `YYYY-MM-DD` format. |
+| `lat` | `latitude` | `float` | No — defaults to `14.267` | Parcel latitude (degrees N). |
+| `lon` | `longitude` | `float` | No — defaults to `-90.133` | Parcel longitude (degrees W). |
+| `shape_type` | `shape`, `forma` | `str` | No — defaults to `"rectangulo"` | Parcel geometry: `"rectangulo"`, `"cuadrilatero"`, or `"triangulo"`. |
+| `sides` | `terrain_sides`, `lados` | `List[float]` | Conditional | Required for `"triangulo"` (3 values) and `"cuadrilatero"` (4 values). |
+| `width` | `terrain_width_m`, `ancho_m` | `float` | Conditional | Parcel width in metres (used for `"rectangulo"`). |
+| `length` | `terrain_length_m`, `largo_m` | `float` | Conditional | Parcel length in metres (used for `"rectangulo"`). |
+| `capital` | `capital_disponible_q`, `capital_inversion` | `float` | ✅ Yes | Available investment capital in Quetzales (Q). |
+| `corn_type` | `tipo_maiz` | `str` | No — defaults to `"blanco"` | Maize variety; only `"blanco"` is supported. |
+
+**Returns:** a `ValidatedInput` dataclass with the following fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `sowing_date` | `str` | Sanitized date string in `YYYY-MM-DD` format. |
+| `lat` | `float` | Validated latitude. |
+| `lon` | `float` | Validated longitude. |
+| `shape_type` | `str` | Normalized and sanitized shape type (lowercase). |
+| `sides` | `List[float]` | Validated list of side lengths in metres. |
+| `width` | `float` | Validated parcel width in metres. |
+| `length` | `float` | Validated parcel length in metres. |
+| `capital` | `float` | Validated investment capital (Q). |
+| `corn_type` | `str` | Validated and lowercased maize type. |
+| `capital_warnings` | `List[str]` | Non-blocking warnings about capital adequacy (may be empty). |
+| `capital_per_manzana` | `float` | Computed investment per manzana (Q/mz). |
+
+The `ValidatedInput` dataclass also exposes three computed properties: `area_m2` (parcel area in m²), `manzanas` (area in Guatemalan traditional manzanas, where 1 mz = 7,000 m²), and `hectareas` (area in international hectares).
+
+---
+
+## Geographic Validation
+
+AGRO-JUTIAPA is calibrated **exclusively** for the Calderas micro-region in San José Acatempa, Jutiapa, Guatemala. Any coordinate outside the following strict bounding box raises a `ValidationError` with a bilingual descriptive message — no fallback or nearest-point snapping is performed.
+
+| Axis | Minimum | Maximum |
+|---|---|---|
+| Latitude (degrees N) | `14.240` | `14.290` |
+| Longitude (degrees W) | `-90.160` | `-90.110` |
+
+If either coordinate falls outside these bounds, `validate_and_sanitize()` raises:
+
+```
+ValidationError: UBICACIÓN NO PERMITIDA: Este sistema está diseñado, calibrado y
+habilitado ÚNICAMENTE para Calderas, San José Acatempa, Jutiapa (Guatemala).
+Coordenadas recibidas: (<lat>, <lon>).
+Límite permitido para Calderas: Lat [14.24, 14.29], Lon [-90.16, -90.11].
+  field="lat/lon"
+```
+
+<Note>
+The bounding box is derived from 45 years of ERA5 reanalysis data and ICTA field studies specific to this micro-region. Applying the model to coordinates outside Calderas would produce unreliable probability estimates because the RF-03 model was trained solely on local historical observations.
+</Note>
+
+---
+
+## Date Validation
+
+Sowing dates must satisfy three sequential checks:
+
+<Steps>
+  <Step title="Format check">
+    The date string must match the regular expression `^\d{4}-\d{2}-\d{2}$`. Any other separator, order, or partial date raises a `ValidationError` immediately.
+  </Step>
+  <Step title="Calendar validity">
+    The string is parsed with `datetime.strptime(..., "%Y-%m-%d")`. Logically impossible dates such as `2026-02-30` or `2025-13-01` raise a `ValidationError` referencing the Gregorian calendar violation.
+  </Step>
+  <Step title="Range check">
+    The parsed date must fall within the historical archive and planning horizon: **1981-01-01** to **2030-12-31** (inclusive). Dates before 1981 lie outside the ERA5 record; dates after 2030 exceed the supported forecast horizon.
+  </Step>
+</Steps>
+
+String inputs are also pre-processed through `sanitize_string()` before format checking to strip any injection payloads embedded in the date field.
+
+---
+
+## Financial Validation
+
+Capital validation operates on **two independent levels**: an absolute range check and a per-manzana adequacy check. Only the absolute range check is a hard error; per-manzana concerns produce non-blocking warnings stored in `ValidatedInput.capital_warnings`.
+
+**Absolute limits (hard errors):**
+
+| Limit | Value | Rationale |
+|---|---|---|
+| `capital_min_q` | `500.0 Q` | Below this amount, not even seed can be purchased. |
+| `capital_max_q` | `150,000.0 Q` | Upper ceiling for family-scale agriculture in the region. |
+
+**Per-manzana adequacy (soft warnings):**
+
+| Condition | Threshold | Warning type |
+|---|---|---|
+| Capital per manzana below historical minimum | `< 2,000 Q/mz` | Subsistence-risk warning — may be insufficient for fertilisation and complete cultural practices. |
+| Capital per manzana above maximum technified cost | `> 25,000 Q/mz` | Over-capitalisation warning — suggests the figure may include fixed assets unrelated to the crop cycle. |
+
+Per-manzana capital is calculated as `capital / manzanas`, where `manzanas = area_m2 / 7000`. Warnings do **not** prevent the pipeline from running; they are surfaced in `PipelineResult.validation_summary` and the generated PDF report so that extensionists can counsel farmers appropriately.
+
+---
+
+## Terrain Validation
+
+Parcel geometry is validated in two stages — per-side range checks, and then shape-specific geometric consistency.
+
+**Side length limits:**
+
+| Limit | Value |
+|---|---|
+| `side_min_m` | `1.0 m` |
+| `side_max_m` | `2,000.0 m` |
+| `max_area_m2` | `700,000.0 m²` (100 manzanas) |
+
+**Shape-specific rules:**
+
+- **`rectangulo`** — Requires `width` and `length`; both are validated against `[1.0, 2000.0]` m. Area = `width × length`.
+- **`cuadrilatero`** — Requires exactly 4 side lengths in `sides`. Area is calculated using the MAGA averaged-opposite-sides technique: `((a + c) / 2) × ((b + d) / 2)`.
+- **`triangulo`** — Requires exactly 3 side lengths in `sides`. After range-checking each side, the **triangle inequality** is verified: every pair of sides must sum to strictly more than the third side. Violating this raises a `ValidationError` citing all three lengths. Area is computed with Heron's formula.
+
+---
+
+## String Sanitization
+
+All string inputs — including `shape_type`, `corn_type`, and `sowing_date` before numeric parsing — pass through `sanitize_string()`. The function applies **up to 5 iterative passes** to defeat nested or recursive injection payloads (e.g., `<scr<script>ipt>` or `....//`).
+
+Each pass applies the following steps in order:
+
+<Steps>
+  <Step title="Type and length guard">
+    Rejects any non-string value. Enforces a maximum length of `100` characters (configurable via `max_length`) to prevent denial-of-service through oversized inputs.
+  </Step>
+  <Step title="Script tag removal">
+    Strips `<script>...</script>` blocks and their inner content using a case-insensitive, multiline regex (`(?is)<\s*script[^>]*>.*?<\s*/\s*script\s*>`).
+  </Step>
+  <Step title="HTML tag removal">
+    Removes any remaining or malformed HTML tags matching `<[^>]+>`.
+  </Step>
+  <Step title="Path traversal removal">
+    Deletes all occurrences of `..`, `/`, and `\` to neutralise directory-traversal sequences.
+  </Step>
+  <Step title="SQL keyword and comment removal">
+    Removes the statement terminator `;` and the SQL comment sequence `--`. Then strips the following SQL keywords as whole words (case-insensitive): `SELECT`, `DROP`, `INSERT`, `DELETE`, `UPDATE`, `UNION`.
+  </Step>
+</Steps>
+
+The loop exits early as soon as a full pass produces no further changes. The final result is stripped of leading and trailing whitespace.
+
+---
+
+## ValidationError Exception
+
+`ValidationError` is a custom subclass of Python's built-in `ValueError`. It carries a human-readable `message` and an optional `field` name identifying which input parameter triggered the failure, making it straightforward to surface structured error responses in both the CLI and the HTTP API.
+
+```python
+class ValidationError(ValueError):
+    def __init__(self, message: str, field: Optional[str] = None): ...
+    message: str   # Full descriptive error message
+    field: str     # Name of the offending input parameter (may be None)
+```
+
+Catch it in application code like this:
+
+```python
+from core.input_validator import validate_and_sanitize, ValidationError
+
+try:
+    validated = validate_and_sanitize(
+        sowing_date="2026-06-01",
+        lat=14.267,
+        lon=-90.133,
+        shape_type="rectangulo",
+        sides=None,
+        width=100,
+        length=70,
+        capital=7200,
+        corn_type="blanco",
+    )
+except ValidationError as e:
+    print(f"Validation failed on field '{e.field}': {e.message}")
+```
+
+---
+
+## get_validation_summary()
+
+After a successful call to `validate_and_sanitize()`, pass the returned `ValidatedInput` object to `get_validation_summary()` to obtain a structured audit dictionary suitable for embedding in PDF reports and REST API responses.
+
+```python
+from core.input_validator import validate_and_sanitize, get_validation_summary
+
+validated = validate_and_sanitize(sowing_date="2026-06-01", capital=7200)
+summary = get_validation_summary(validated)
+```
+
+The returned dictionary has the following top-level structure:
+
+```json
+{
+  "status": "VALIDATED",
+  "timestamp_utc": "2026-06-01T10:00:00Z",
+  "audit_trail": ["...", "..."],
+  "checks": {
+    "date_validation": { "passed": true, "sowing_date": "...", "min_allowed_date": "1981-01-01", "max_allowed_date": "2030-12-31" },
+    "geographic_validation": { "passed": true, "lat": 14.267, "lon": -90.133, "region": "Jutiapa (Corredor Seco)", "lat_bounds": [14.24, 14.29], "lon_bounds": [-90.16, -90.11] },
+    "terrain_geometry": { "passed": true, "shape_type": "rectangulo", "sides_m": [...], "area_m2": 7000.0, "area_manzanas": 1.0, "area_hectareas": 0.7, "triangle_inequality_checked": false },
+    "financial_adequacy": { "passed": true, "capital_total_q": 7200.0, "capital_per_manzana_q": 7200.0, "historical_range_per_mz": [2000.0, 25000.0], "warnings": [], "warnings_count": 0 },
+    "crop_type": { "passed": true, "corn_type": "blanco", "allowed_types": ["blanco"] },
+    "security_hardening": { "passed": true, "anti_xss_stripped": true, "anti_sqli_stripped": true, "anti_path_traversal_stripped": true, "strict_numeric_enforced": true }
+  },
+  "warnings": []
+}
+```
+
+The `audit_trail` array is a human-readable list of sentences confirming each check (date range, coordinates, geometry, area, crop type, capital, and security filters applied). This dictionary is stored verbatim in `PipelineResult.validation_summary` and printed in the generated PDF report's audit section.
+
+<Note>
+The API server (`server.py`) returns **HTTP 400** with `"validation_error": true` in the JSON response body whenever `validate_and_sanitize()` raises a `ValidationError`. If the raw request body exceeds **10 KB**, the server rejects it with **HTTP 413** before the validator is even invoked, preventing large-payload denial-of-service attacks.
+</Note>

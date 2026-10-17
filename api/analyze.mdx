@@ -1,0 +1,483 @@
+---
+title: "POST /api/analyze — Agrometeorological Viability Analysis"
+sidebarTitle: "POST /api/analyze"
+description: "POST /api/analyze runs the full ERA5 + FAO-56 + XGBoost pipeline and returns a calibrated sowing probability, traffic light verdict, water balance timeline, and P&L projection."
+---
+
+`POST /api/analyze` is the core inference endpoint of AGRO-JUTIAPA. It ingests real-time meteorological observations from the Open-Meteo Live and Archive APIs (ERA5 reanalysis, 1981–present), runs a continuous FAO-56 soil-water balance calibrated for the Franco-Arcillo-Arenoso profile of Jutiapa, evaluates the result through a calibrated XGBoost/Logistic Regression ensemble trained on 45 years of ERA5 data, and returns a full agronomic and financial dossier — including a three-color traffic-light verdict, 60-day daily water balance timeline, 120-day phenological streak analysis, parcel geometry, sowing-density recommendations, and an official MAGA P&L projection — all in a single JSON response.
+
+## Method and Path
+
+```
+POST /api/analyze
+```
+
+**Authentication:** None required.
+
+## Request Body
+
+The request body must be a JSON object. All fields that accept defaults are optional; only `date`, `lat`, and `lon` are strictly required for a meaningful analysis.
+
+<ParamField body="date" type="string" required>
+  Proposed sowing date in `YYYY-MM-DD` format. Used as the anchor for the 30-day antecedent meteorological window and the 60-day forward simulation.
+
+  **Example:** `"2026-06-01"`
+</ParamField>
+
+<ParamField body="lat" type="float" required>
+  Latitude of the parcel centroid in decimal degrees. Must be within the Calderas, San José Acatempa bounding box: **14.240 – 14.290**. Requests outside this range are rejected with HTTP 400.
+
+  **Example:** `14.267`
+</ParamField>
+
+<ParamField body="lon" type="float" required>
+  Longitude of the parcel centroid in decimal degrees. Must be within the Calderas, San José Acatempa bounding box: **-90.160 – -90.110**. Requests outside this range are rejected with HTTP 400.
+
+  **Example:** `-90.133`
+</ParamField>
+
+<ParamField body="shape_type" type="string" default="rectangulo">
+  Parcel geometry type. Controls how `area_m2` and `perimetro_m` are calculated.
+
+  | Value | Formula |
+  |-------|---------|
+  | `"rectangulo"` | `area = width × length` |
+  | `"cuadrilatero"` | Trapezoid approximation: `area = ((s0+s2)/2) × ((s1+s3)/2)` |
+  | `"triangulo"` | Heron's formula using three side lengths |
+</ParamField>
+
+<ParamField body="sides" type="array of floats">
+  Side lengths in metres used when `shape_type` is `"cuadrilatero"` (4 values) or `"triangulo"` (3 values). Ignored for `"rectangulo"`.
+
+  **Example (cuadrilátero):** `[100.0, 70.0, 90.0, 65.0]`
+</ParamField>
+
+<ParamField body="width" type="float" default="100.0">
+  Parcel width in metres. Used only when `shape_type` is `"rectangulo"`.
+</ParamField>
+
+<ParamField body="length" type="float" default="70.0">
+  Parcel length in metres. Used only when `shape_type` is `"rectangulo"`.
+</ParamField>
+
+<ParamField body="capital" type="float" default="7200.0">
+  Producer's own investment capital in Guatemalan Quetzales (Q). Must be at least **Q 500.00**; requests below this threshold are rejected with HTTP 400. Valid range for meaningful financial projections: Q 500 – Q 150,000. Values above Q 25,000/mz or below Q 2,000/mz generate `capital_warnings` in the response without rejecting the request.
+</ParamField>
+
+<ParamField body="corn_type" type="string" default="blanco">
+  Corn variety. Currently only `"blanco"` (white maize, *Maíz blanco de primera*) is supported and matched to MAGA La Terminal wholesale pricing.
+</ParamField>
+
+## Request Examples
+
+<CodeGroup>
+
+```json JSON Body
+{
+  "date": "2026-06-01",
+  "lat": 14.267,
+  "lon": -90.133,
+  "shape_type": "cuadrilatero",
+  "sides": [100.0, 70.0, 90.0, 65.0],
+  "capital": 7200.0,
+  "corn_type": "blanco"
+}
+```
+
+```bash cURL (local server)
+curl -X POST http://localhost:8000/api/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "date": "2026-06-01",
+    "lat": 14.267,
+    "lon": -90.133,
+    "shape_type": "cuadrilatero",
+    "sides": [100.0, 70.0, 90.0, 65.0],
+    "capital": 7200.0,
+    "corn_type": "blanco"
+  }'
+```
+
+```bash cURL (Vercel)
+curl -X POST https://your-project.vercel.app/api/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "date": "2026-06-01",
+    "lat": 14.267,
+    "lon": -90.133,
+    "shape_type": "rectangulo",
+    "width": 100.0,
+    "length": 70.0,
+    "capital": 7200.0,
+    "corn_type": "blanco"
+  }'
+```
+
+</CodeGroup>
+
+## Response Fields
+
+<ResponseField name="success" type="boolean">
+  `true` on a successful analysis; `false` on any error.
+</ResponseField>
+
+<ResponseField name="sowing_date" type="string">
+  Echo of the requested sowing date in `YYYY-MM-DD` format.
+</ResponseField>
+
+<ResponseField name="lat" type="float">
+  Latitude used in the analysis.
+</ResponseField>
+
+<ResponseField name="lon" type="float">
+  Longitude used in the analysis.
+</ResponseField>
+
+<ResponseField name="probabilidad" type="float">
+  Calibrated sowing success probability from the XGBoost/Logistic Regression ensemble. Range: **0.0 – 1.0** (clamped to 0.05 – 0.92 by the model). Further reduced to ≤ 0.35 if critical phenological alerts are present, if the ETa/ETc ratio falls below 0.90, or if waterlogging exceeds 8 days.
+</ResponseField>
+
+<ResponseField name="semaforo_estado" type="string">
+  Traffic-light classification label.
+
+  | Value | Threshold |
+  |-------|-----------|
+  | `"RECOMENDADO PARA SIEMBRA"` | probabilidad ≥ 0.70 |
+  | `"SIEMBRA CONDICIONADA"` | 0.40 ≤ probabilidad < 0.70 |
+  | `"NO SEMBRAR"` | probabilidad < 0.40, or any critical alert |
+</ResponseField>
+
+<ResponseField name="semaforo_color" type="string">
+  Color code for the traffic-light verdict: `"Verde"`, `"Amarillo"`, or `"Rojo"`.
+</ResponseField>
+
+<ResponseField name="semaforo_accion" type="string">
+  Human-readable agronomic recommendation associated with the verdict, e.g. instructions to proceed, apply drought-tolerant varieties, or abort sowing.
+</ResponseField>
+
+<ResponseField name="fase_enso" type="string">
+  Detected ENSO phase at the time of the requested sowing date: `"El Niño"`, `"La Niña"`, `"Neutral"`, or `"N/D"`.
+</ResponseField>
+
+<ResponseField name="terreno" type="object">
+  Parcel geometry calculated from the submitted shape parameters.
+
+  <Expandable title="terreno fields">
+    <ResponseField name="forma" type="string">
+      Human-readable geometry label: `"Rectangular"`, `"Cuadrilátero Irregular"`, or `"Triangular"`.
+    </ResponseField>
+    <ResponseField name="shape_type" type="string">
+      Echo of the submitted `shape_type`.
+    </ResponseField>
+    <ResponseField name="sides" type="array of floats">
+      Echo of the submitted side lengths.
+    </ResponseField>
+    <ResponseField name="vertices" type="array">
+      Polygon vertices computed by the geometry engine (available in the Python server response via `t.get_polygon_vertices()`).
+    </ResponseField>
+    <ResponseField name="ancho_m" type="float">
+      Parcel width in metres (rectangular parcels).
+    </ResponseField>
+    <ResponseField name="largo_m" type="float">
+      Parcel length in metres (rectangular parcels).
+    </ResponseField>
+    <ResponseField name="area_m2" type="integer">
+      Calculated parcel area in square metres.
+    </ResponseField>
+    <ResponseField name="manzanas" type="float">
+      Area in manzanas (1 mz = 7,000 m²), rounded to 3 decimal places.
+    </ResponseField>
+    <ResponseField name="hectareas" type="float">
+      Area in hectares, rounded to 3 decimal places.
+    </ResponseField>
+    <ResponseField name="perimetro_m" type="integer">
+      Calculated parcel perimeter in metres.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="densidad" type="object">
+  Sowing density recommendations adapted to the traffic-light verdict.
+
+  <Expandable title="densidad fields">
+    <ResponseField name="densidad_plantas_m2" type="float">
+      Recommended plant density per m²: `5.8` (Verde), `4.4` (Amarillo), or `3.6` (Rojo).
+    </ResponseField>
+    <ResponseField name="densidad_plantas_mz" type="integer">
+      Recommended plant density per manzana (density_m2 × 7,000).
+    </ResponseField>
+    <ResponseField name="plantas_totales_predio" type="integer">
+      Total recommended plant population for the submitted parcel area.
+    </ResponseField>
+    <ResponseField name="semillas_totales_requeridas" type="integer">
+      Total seeds required, applying a 1.235× factor to account for 88% germination power and 92% field survival rate.
+    </ResponseField>
+    <ResponseField name="libras_semilla" type="string">
+      Total seed weight in pounds (approx. 1,400 seeds/lb).
+    </ResponseField>
+    <ResponseField name="bolsas_comerciales" type="string">
+      Number of commercial seed bags required (60,000 seeds/bag), to 2 decimal places.
+    </ResponseField>
+    <ResponseField name="distancia_surcos_cm" type="float">
+      Recommended inter-row distance in cm: `80` (Verde), `85` (Amarillo), or `90` (Rojo).
+    </ResponseField>
+    <ResponseField name="distancia_posturas_cm" type="float">
+      Recommended within-row plant spacing in cm: `22` (Verde), `27` (Amarillo), or `31` (Rojo).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="financiero" type="object">
+  Official MAGA-priced P&L projection for the submitted parcel and capital.
+
+  <Expandable title="financiero fields">
+    <ResponseField name="precio_maga_qq" type="float">
+      Wholesale price of Maíz blanco, de primera at La Terminal (Q/quintal), fetched live from MAGA or falling back to Q 235.00.
+    </ResponseField>
+    <ResponseField name="capital_inversion_q" type="float">
+      Echo of the submitted investment capital in Quetzales.
+    </ResponseField>
+    <ResponseField name="rendimiento_estimado_qq_mz" type="float">
+      Estimated yield in quintals per manzana, calculated as `65.0 × (0.40 + 0.60 × probabilidad)`.
+    </ResponseField>
+    <ResponseField name="produccion_total_estimada_qq" type="float">
+      Total estimated production for the parcel in quintals (`rendimiento × manzanas`).
+    </ResponseField>
+    <ResponseField name="ingreso_bruto_q" type="float">
+      Gross revenue in Quetzales (`produccion_total × precio_maga_qq`).
+    </ResponseField>
+    <ResponseField name="utilidad_neta_q" type="float">
+      Net profit in Quetzales (`ingreso_bruto − capital_inversion`). May be negative.
+    </ResponseField>
+    <ResponseField name="roi_pct" type="float">
+      Return on investment as a percentage (`utilidad_neta / capital_inversion × 100`).
+    </ResponseField>
+    <ResponseField name="punto_equilibrio_qq" type="float">
+      Break-even production in quintals (`capital_inversion / precio_maga_qq`).
+    </ResponseField>
+    <ResponseField name="inversion_por_quintal_q" type="float">
+      Investment cost per quintal produced (`capital_inversion / produccion_total`).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="timeline" type="object">
+  Daily water-balance simulation arrays over the 60-day phenological window following the sowing date.
+
+  <Expandable title="timeline fields">
+    <ResponseField name="days" type="array of integers">
+      Day index from 1 to 60.
+    </ResponseField>
+    <ResponseField name="precipDaily" type="array of floats">
+      Daily precipitation in mm for each simulated day.
+    </ResponseField>
+    <ResponseField name="precipAcc" type="array of floats">
+      Accumulated precipitation in mm from sowing date.
+    </ResponseField>
+    <ResponseField name="etcAcc" type="array of floats">
+      Accumulated crop evapotranspiration (ETc = Kc × ET₀, FAO-56) in mm.
+    </ResponseField>
+    <ResponseField name="soilFrac" type="array of floats">
+      Daily soil water fraction (current soil water / TAW), range 0.0 – 1.0, where TAW = 105.6 mm for Jutiapa's Franco-Arcillo-Arenoso profile.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="rain_streak_report" type="object">
+  Phenological streak analysis over the full 120-day crop cycle.
+
+  <Expandable title="rain_streak_report fields">
+    <ResponseField name="veredicto_general" type="string">
+      Summary verdict: `"APTO PARA SIEMBRA"`, `"SIEMBRA CON PRECAUCIÓN"`, or `"NO APTO PARA SIEMBRA"`.
+    </ResponseField>
+    <ResponseField name="puntaje_riesgo_pct" type="string">
+      Calibrated probability expressed as a percentage string, e.g. `"71.0%"`.
+    </ResponseField>
+    <ResponseField name="calidad_distribucion" type="string">
+      Qualitative label for rainfall distribution quality: `"Buena"`, `"Regular"`, or `"Deficiente"`.
+    </ResponseField>
+    <ResponseField name="canicula" type="object">
+      Dry-spell (canícula) detection result: `detectada` (boolean), `severidad` (`"Ninguna"` / `"Leve"` / `"Moderada"` / `"Severa"`), and `dias_duracion` (longest consecutive dry-day streak in Stage 2).
+    </ResponseField>
+    <ResponseField name="tabla_etapas" type="array">
+      Array of 4 objects — one per phenological stage (Germinación, Desarrollo Vegetativo, Floración, Llenado de Grano) — each containing `etapa`, `dias`, `lluvia_total`, `racha_seca_max`, `racha_humeda_max`, `adecuacion`, and `nivel_riesgo`.
+    </ResponseField>
+    <ResponseField name="alertas_criticas" type="array of strings">
+      List of critical agronomic alert messages triggered by dangerous dry or wet streaks in any stage. Empty array if no alerts.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="capital_warnings" type="array of strings">
+  Advisory messages if the submitted capital falls outside the locally calibrated range (below Q 2,000/mz or above Q 25,000/mz). Empty array if capital is within the expected range.
+</ResponseField>
+
+<ResponseField name="report_pdf_path" type="string or null">
+  Basename of the generated three-page PDF technical report (e.g. `"Informe_Viabilidad_Maiz_Jutiapa.pdf"`), accessible at `/output/<filename>` on the local server. `null` if PDF generation was skipped or failed.
+</ResponseField>
+
+## Full Response Example
+
+```json
+{
+  "success": true,
+  "sowing_date": "2026-06-01",
+  "lat": 14.267,
+  "lon": -90.133,
+  "probabilidad": 0.71,
+  "semaforo_estado": "RECOMENDADO PARA SIEMBRA",
+  "semaforo_color": "Verde",
+  "semaforo_accion": "Condiciones hídricas altamente favorables (cobertura > 90%). Proceder con siembra tecnificada en fecha programada.",
+  "fase_enso": "Neutral",
+  "terreno": {
+    "forma": "Cuadrilátero Irregular",
+    "shape_type": "cuadrilatero",
+    "sides": [100.0, 70.0, 90.0, 65.0],
+    "vertices": [],
+    "ancho_m": 100.0,
+    "largo_m": 70.0,
+    "area_m2": 7337,
+    "manzanas": 1.048,
+    "hectareas": 0.734,
+    "perimetro_m": 325
+  },
+  "densidad": {
+    "densidad_plantas_m2": 5.8,
+    "densidad_plantas_mz": 40600,
+    "plantas_totales_predio": 42555,
+    "semillas_totales_requeridas": 52555,
+    "libras_semilla": "37.5",
+    "bolsas_comerciales": "0.88",
+    "distancia_surcos_cm": 80.0,
+    "distancia_posturas_cm": 22.0,
+    "diagnostico_densidad": "Densidad calculada adaptada al régimen hídrico de la siembra en Jutiapa."
+  },
+  "financiero": {
+    "fuente_oficial_maga": "MAGA SIMPA Precios Mayoristas (La Terminal)",
+    "fecha_actualizacion_maga": "09/10/2026",
+    "tipo_maiz": "Blanco (de primera)",
+    "precio_maga_qq": 235.0,
+    "area_manzanas": 1.048,
+    "rendimiento_estimado_qq_mz": 37.4,
+    "produccion_total_estimada_qq": 39.2,
+    "capital_inversion_q": 7200.0,
+    "inversion_por_quintal_q": 183.67,
+    "ingreso_bruto_q": 9212.0,
+    "utilidad_neta_q": 2012.0,
+    "roi_pct": 27.9,
+    "punto_equilibrio_qq": 30.6,
+    "escenarios_sensibilidad": [
+      {
+        "Escenario": "Optimista: Buen régimen de lluvias (+15%)",
+        "Rendimiento (qq/mz)": 74.8,
+        "Producción Total (qq)": 78.4,
+        "Ingreso Bruto (Q)": 18424.0,
+        "Utilidad Neta (Q)": 11224.0,
+        "ROI (%)": 155.9
+      },
+      {
+        "Escenario": "Proyectado: Modelo agroclimático",
+        "Rendimiento (qq/mz)": 37.4,
+        "Producción Total (qq)": 39.2,
+        "Ingreso Bruto (Q)": 9212.0,
+        "Utilidad Neta (Q)": 2012.0,
+        "ROI (%)": 27.9
+      },
+      {
+        "Escenario": "Pesimista: Déficit hídrico o canícula (-55%)",
+        "Rendimiento (qq/mz)": 29.3,
+        "Producción Total (qq)": 30.7,
+        "Ingreso Bruto (Q)": 7214.5,
+        "Utilidad Neta (Q)": 14.5,
+        "ROI (%)": 0.2
+      }
+    ]
+  },
+  "timeline": {
+    "days": [1, 2, 3, "...60"],
+    "precipDaily": [8.2, 0.0, 12.5, "..."],
+    "precipAcc": [8.2, 8.2, 20.7, "..."],
+    "etcAcc": [1.5, 3.0, 4.6, "..."],
+    "soilFrac": [0.62, 0.58, 0.71, "..."]
+  },
+  "rain_streak_report": {
+    "veredicto_general": "APTO PARA SIEMBRA",
+    "puntaje_riesgo_pct": "71.0%",
+    "calidad_distribucion": "Buena",
+    "total_precipitacion_ciclo_mm": "485.3 mm",
+    "canicula": {
+      "detectada": true,
+      "severidad": "Leve",
+      "dias_duracion": 6
+    },
+    "tabla_etapas": [
+      {
+        "etapa": "Germinación y Emergencia",
+        "dias": "Días 1-15",
+        "lluvia_total": "68.4 mm",
+        "racha_seca_max": "3 días",
+        "racha_humeda_max": "2 días",
+        "adecuacion": "Adecuado",
+        "nivel_riesgo": "Bajo"
+      },
+      {
+        "etapa": "Floración y Polinización",
+        "dias": "Días 56-75",
+        "lluvia_total": "94.1 mm",
+        "racha_seca_max": "2 días",
+        "racha_humeda_max": "4 días",
+        "adecuacion": "Adecuado",
+        "nivel_riesgo": "Bajo"
+      }
+    ],
+    "alertas_criticas": [],
+    "directiva_agronomica": "Condiciones hídricas altamente favorables (cobertura > 90%). Proceder con siembra tecnificada en fecha programada."
+  },
+  "capital_warnings": [],
+  "report_pdf_path": "Informe_Viabilidad_Maiz_Jutiapa.pdf"
+}
+```
+
+## Error Responses
+
+**HTTP 400 — Geographic validation error**
+
+```json
+{
+  "success": false,
+  "error": "UBICACIÓN NO PERMITIDA: Este sistema está diseñado, calibrado y habilitado ÚNICAMENTE para Calderas, San José Acatempa, Jutiapa (Guatemala). Coordenadas recibidas: (14.100, -90.133). Límite permitido para Calderas: Lat [14.24, 14.29], Lon [-90.16, -90.11].",
+  "validation_error": true
+}
+```
+
+**HTTP 400 — Capital below minimum**
+
+```json
+{
+  "success": false,
+  "error": "El capital de inversión mínimo permitido es de Q 500.00.",
+  "validation_error": true
+}
+```
+
+**HTTP 413 — Request body too large**
+
+```json
+{
+  "success": false,
+  "error": "El cuerpo de la petición excede el límite de 10240 bytes."
+}
+```
+
+**HTTP 500 — Internal pipeline error**
+
+```json
+{
+  "success": false,
+  "error": "Failed to fetch weather data: connection timeout after 4500ms."
+}
+```
+
+<Note>
+  When the Open-Meteo Live API or Archive API is unreachable, the pipeline automatically falls back to a stochastic climatological function calibrated for Jutiapa (ERA5 long-term daily normals). The response will still be returned with `success: true`; check `financiero.fuente_oficial_maga` to confirm the data source used.
+</Note>

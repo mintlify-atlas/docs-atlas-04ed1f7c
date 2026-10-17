@@ -1,0 +1,206 @@
+---
+title: "Running Headless Analyses with the AGRO-JUTIAPA CLI"
+sidebarTitle: "CLI"
+description: "Full reference for python main.py — every argument, default value, and example for running batch analyses, forcing cache refresh, and skipping PDF generation."
+---
+
+`main.py` exposes the full AGRO-JUTIAPA pipeline as a headless command-line interface, making it suitable for automation scripts, CI/CD pipelines, batch analysis of multiple sowing dates, and server-side scheduled jobs. It accepts the same agronomic and financial parameters as the web form, executes the entire pipeline — ERA5 data ingestion, FAO-56 soil water balance, XGBoost/Logistic ensemble inference, density and P&L calculations — and prints a structured report to standard output while writing output files to the `output/` directory.
+
+## Basic Usage
+
+Running `main.py` without any arguments applies the built-in defaults for Calderas, San José Acatempa, Jutiapa, making it easy to get a baseline result immediately after installation:
+
+```bash
+python main.py
+```
+
+This is equivalent to:
+
+```bash
+python main.py \
+  --date 2026-06-01 \
+  --lat 14.267 \
+  --lon -90.133 \
+  --shape cuadrilatero \
+  --sides 100.0 70.0 90.0 65.0 \
+  --capital 6500.0 \
+  --corn-type blanco
+```
+
+The defaults represent a typical irregular quadrilateral plot in Calderas with sides of 100 m, 70 m, 90 m, and 65 m, a planned Primera sowing on 1 June 2026, and an initial investment capital of Q 6,500.
+
+## All Arguments
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--date` | `str` (YYYY-MM-DD) | `2026-06-01` | Planned sowing date. Drives the 60-day phenological simulation window and the 30-day antecedent soil-moisture calculation. |
+| `--lat` | `float` | `14.267` | Parcel latitude. Restricted to **14.240–14.290** (Calderas bounding box). |
+| `--lon` | `float` | `-90.133` | Parcel longitude. Restricted to **-90.160–-90.110** (Calderas bounding box). |
+| `--shape` | `cuadrilatero` \| `triangulo` \| `rectangulo` | `cuadrilatero` | Geometric shape of the terrain. Controls how area and perimeter are computed. |
+| `--sides` | one or more `float` | `[100.0, 70.0, 90.0, 65.0]` | Side lengths in meters. Provide **4 values** for `cuadrilatero`, **3 values** for `triangulo`. Ignored when `--shape rectangulo` is used. |
+| `--width` | `float` (meters) | `100.0` | Parcel width. Used only when `--shape rectangulo`. |
+| `--length` | `float` (meters) | `70.0` | Parcel length. Used only when `--shape rectangulo`. |
+| `--capital` | `float` (Quetzales) | `6500.0` | Farmer's own investment capital. Drives the P&L projection, break-even calculation, and the three-scenario sensitivity matrix. |
+| `--corn-type` | `blanco` | `blanco` | Maize variety. Currently the only supported type is `blanco` (white maize, *de primera*, Mercado La Terminal). |
+| `--force-refresh` | flag | `False` | Forces re-download of ERA5 data from Open-Meteo and ENSO indices from NOAA PSL, bypassing the local `.cache/` directory. |
+| `--no-pdf` | flag | `False` | Skips PDF generation (ReportLab). All other outputs — console report, PNG charts — are still produced. Useful in headless environments where ReportLab is unavailable. |
+
+## Example Commands
+
+<CodeGroup>
+
+```bash Default run
+# Calderas defaults: 2026-06-01, irregular quadrilateral 100×70×90×65 m, Q 6,500
+python main.py
+```
+
+```bash Custom irregular quadrilateral
+# Larger plot with higher capital, sowing in mid-May
+python main.py \
+  --date 2026-05-15 \
+  --shape cuadrilatero \
+  --sides 120 80 110 75 \
+  --capital 9000
+```
+
+```bash Triangle parcel
+# Triangular plot (three surveyed sides), lower capital
+python main.py \
+  --shape triangulo \
+  --sides 80 75 90 \
+  --capital 5000
+```
+
+```bash Rectangular parcel
+# Standard rectangular plot 100 m × 70 m
+python main.py \
+  --shape rectangulo \
+  --width 100 \
+  --length 70 \
+  --capital 7200
+```
+
+```bash Force refresh, skip PDF
+# Re-download all remote data and skip PDF generation (fast headless mode)
+python main.py --force-refresh --no-pdf
+```
+
+```bash Custom date and coordinates
+# Different sowing date and coordinates within the Calderas bounding box
+python main.py \
+  --date 2026-06-15 \
+  --lat 14.275 \
+  --lon -90.140 \
+  --shape cuadrilatero \
+  --sides 95 65 88 60 \
+  --capital 8000
+```
+
+</CodeGroup>
+
+## Understanding CLI Output
+
+The console output is divided into clearly delimited sections separated by `=` and `-` ruler lines. Here is a walkthrough of each section:
+
+### REPORTE AGROCLIMÁTICO Y FINANCIERO
+
+The opening banner confirms the analysed coordinates, the sowing date, the NOAA-sourced ENSO phase, the calibrated probability (%), and the semáforo verdict:
+
+```
+======================================================================
+                    REPORTE AGROCLIMÁTICO Y FINANCIERO
+======================================================================
+UBICACIÓN ANALIZADA: Lat 14.2670, Lon -90.1330 (Jutiapa, Guatemala)
+FECHA TENTATIVA DE SIEMBRA: 2026-06-01
+FASE ENSO OBSERVADA (NOAA): Neutral
+PROBABILIDAD CALIBRADA:     71.0%
+ESTADO DEL SEMÁFORO:        [VERDE] - RECOMENDADO PARA SIEMBRA
+ACCIÓN RECOMENDADA:         Condiciones hídricas altamente favorables ...
+CRITERIOS DE VIABILIDAD:    ETa/ETc >= 0.90 (90%) | Anegamiento <= 8 días | Ventana: 60 días
+```
+
+### PARCELA Y DENSIDAD
+
+The terrain and seeding section reports the computed parcel geometry and the risk-adjusted planting density:
+
+```
+----------------------------------------------------------------------
+PARCELA Y DENSIDAD DE SIEMBRA (RF-05, RF-06):
+  * Forma del lote: Cuadrilátero Irregular
+  * Superficie calculada: 7,000.0 m² (1.000 mz | 0.700 ha)
+  * Perímetro total: 325.0 metros
+  * Densidad recomendada: 5.8 plantas/m² (40,600 pl/mz)
+  * Población total lote: 40,600 plantas
+  * Semilla total requerida: 50,141 semillas (35.8 lbs / 0.84 bolsas)
+  * Marco de plantación: 80.0 cm entre surcos | 22.0 cm entre posturas
+```
+
+Density is risk-adjusted: **5.8 plants/m²** for Verde, **4.4 plants/m²** for Amarillo, and **3.6 plants/m²** for Rojo. Seed requirements account for 88 % germination power and 92 % field survival.
+
+### PROYECCIÓN FINANCIERA
+
+The financial section shows the live MAGA price, the estimated yield and gross income, net profit, ROI, and break-even point:
+
+```
+----------------------------------------------------------------------
+PROYECCIÓN FINANCIERA Y PÉRDIDAS & GANANCIAS (RF-07):
+  * Fuente Oficial de Precios: MAGA SIMPA Precios Mayoristas (La Terminal)
+  * Fecha Última Actualización: 09/10/2026
+  * Precio Oficial Maíz Blanco (de primera): Q 235.00 / quintal
+  * Capital de Inversión Aportado: Q 6,500.00
+  * Rendimiento Estimado: 45.5 qq/mz -> Producción Total: 45.5 qq
+  * Ingreso Bruto Proyectado:      Q 10,692.50
+  * Utilidad Neta Proyectada:      Q 4,192.50 (ROI: 64.5%)
+  * Punto de Equilibrio:           27.7 quintales
+  * Inversión por Quintal:         Q 142.86 / qq
+```
+
+### EVALUACIÓN DE RACHAS
+
+When historical data is available for the simulated 60-day window, an ex-post validation section appears showing the real ETa/ETc ratio, waterlogging days, and whether the season would have been a success or failure by the strict criteria (ETa/ETc ≥ 0.90, waterlogging ≤ 8 days).
+
+The phenological streak table below it covers all four maize stages over the full 120-day cycle, reporting accumulated rainfall, maximum dry and wet streaks, and a risk level per stage.
+
+### ARCHIVOS GENERADOS
+
+The final banner lists every output file successfully written:
+
+```
+======================================================================
+ARCHIVOS GENERADOS:
+  [OK] Reporte Ejecutivo: output/Informe_Viabilidad_Maiz_Jutiapa.pdf
+  [OK] Gráfica (balance_hidrico): output/balance_hidrico_siembra.png
+  [OK] Gráfica (plano_terreno): output/plano_terreno.png
+  [OK] Gráfica (calibracion_modelo): output/calibracion_modelo.png
+======================================================================
+```
+
+## Output Files
+
+All files are written to the `output/` subdirectory of the project root:
+
+| File | Description |
+|---|---|
+| `output/Informe_Viabilidad_Maiz_Jutiapa.pdf` | Three-page official technical dictum (ReportLab, Letter format). Omitted if `--no-pdf` is passed. |
+| `output/balance_hidrico_siembra.png` | High-resolution Matplotlib chart of the 60-day water balance simulation (daily precipitation, accumulated ETc, soil moisture fraction). |
+| `output/plano_terreno.png` | Vector-quality CAD rendering of the parcel polygon with annotated side lengths and computed area. |
+| `output/calibracion_modelo.png` | Reliability diagram showing the sigmoid probability calibration curve of the XGBoost/Logistic ensemble against historical ERA5 seasons. |
+
+<Tip>
+  On Windows terminals (PowerShell, Command Prompt) the console output contains Unicode characters (°, ², %, box-drawing symbols). If you see garbled characters or `UnicodeEncodeError`, reconfigure the terminal to UTF-8 before running the CLI:
+
+  ```powershell
+  # PowerShell — set console to UTF-8
+  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+  python main.py
+  ```
+
+  Alternatively, set the environment variable `PYTHONIOENCODING=utf-8` before launching:
+
+  ```powershell
+  $env:PYTHONIOENCODING = "utf-8"
+  python main.py
+  ```
+
+  The pipeline itself calls `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` automatically when `sys.stdout` supports it, which covers most modern Python 3.10+ installs on Windows.
+</Tip>

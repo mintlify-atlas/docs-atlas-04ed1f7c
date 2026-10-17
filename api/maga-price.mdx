@@ -1,0 +1,116 @@
+---
+title: "GET /api/maga-price — Real-Time MAGA Corn Price"
+sidebarTitle: "GET /api/maga-price"
+description: "GET /api/maga-price scrapes the official MAGA Guatemala wholesale corn price from La Terminal market in real time, with a 10-minute cache and Q 235.00 fallback."
+---
+
+`GET /api/maga-price` delivers the current official wholesale price of *Maíz blanco, de primera* at the La Terminal market in Guatemala City, scraped in real time from the Ministerio de Agricultura, Ganadería y Alimentación (MAGA) public price portal. The price is used internally by `POST /api/analyze` to anchor the P&L projection, but is also exposed as a standalone endpoint for any client that needs the live price directly — no authentication, no API key, and no query parameters required.
+
+## Method and Path
+
+```
+GET /api/maga-price
+```
+
+**Authentication:** None required.
+
+## Query Parameters
+
+None.
+
+## Caching
+
+Responses are cached in memory for **10 minutes** (`CACHE_TTL_MS = 600,000 ms`). During this window, all requests return the cached object without making a new outbound HTTP request to the MAGA portal. The cache is scoped to the server process and resets on restart.
+
+On Vercel, the function also sets the following HTTP response header so that the CDN edge layer can serve cached responses for up to 10 minutes and continue serving stale content for up to 20 minutes while revalidating in the background:
+
+```
+Cache-Control: public, s-maxage=600, stale-while-revalidate=1200
+```
+
+## Fallback
+
+If the MAGA portal (`https://precios.maga.gob.gt/diarios/diarios.html`) is unreachable, times out (after 4,500 ms), or returns an HTML response that does not match the expected table pattern, the endpoint returns the following static fallback object with `estado: "fallback"` instead of `"en_linea"`:
+
+```json
+{
+  "producto": "Maíz blanco, de primera",
+  "mercado": "La Terminal",
+  "medida": "Quintal",
+  "precio": 235.0,
+  "fecha": "09/10/2026",
+  "fuente": "MAGA Guatemala - Precios Diarios de Mercados Mayoristas",
+  "estado": "fallback"
+}
+```
+
+The fallback price of **Q 235.00** is the last confirmed reference price and is used as the default in all financial calculations when live scraping is unavailable.
+
+## Request Example
+
+```bash
+curl http://localhost:8000/api/maga-price
+```
+
+## Response Fields
+
+<ResponseField name="producto" type="string">
+  Product name as it appears in the MAGA wholesale price table.
+
+  **Value:** `"Maíz blanco, de primera"`
+</ResponseField>
+
+<ResponseField name="mercado" type="string">
+  Market where the price was recorded.
+
+  **Value:** `"La Terminal"`
+</ResponseField>
+
+<ResponseField name="medida" type="string">
+  Unit of measure for the quoted price.
+
+  **Value:** `"Quintal"`
+</ResponseField>
+
+<ResponseField name="precio" type="float">
+  Current wholesale price in Guatemalan Quetzales per quintal (Q/qq), extracted from the MAGA portal or falling back to `235.0`.
+</ResponseField>
+
+<ResponseField name="fecha" type="string">
+  Publication date of the price in `DD/MM/YYYY` format, extracted from the `<h5>` date header on the MAGA page.
+
+  **Example:** `"09/10/2026"`
+</ResponseField>
+
+<ResponseField name="fuente" type="string">
+  Official source attribution string.
+
+  **Value:** `"MAGA Guatemala - Precios Diarios de Mercados Mayoristas"`
+</ResponseField>
+
+<ResponseField name="estado" type="string">
+  Indicates whether the price was fetched live or served from the fallback.
+
+  | Value | Meaning |
+  |-------|---------|
+  | `"en_linea"` | Price was successfully scraped from the MAGA portal in the current or most recent cache window |
+  | `"fallback"` | MAGA portal was unreachable or returned no matching price; static fallback value of Q 235.00 is used |
+</ResponseField>
+
+## Response Example
+
+```json
+{
+  "producto": "Maíz blanco, de primera",
+  "mercado": "La Terminal",
+  "medida": "Quintal",
+  "precio": 235.0,
+  "fecha": "09/10/2026",
+  "fuente": "MAGA Guatemala - Precios Diarios de Mercados Mayoristas",
+  "estado": "en_linea"
+}
+```
+
+<Note>
+  The scraper fetches `https://precios.maga.gob.gt/diarios/diarios.html` using a browser-like `User-Agent` header. It extracts the publication date from the `<h5>DD/MM/YYYY</h5>` element and the price using a regex pattern that locates the `<td>` row matching `"Maíz blanco, de primera"` → `"La Terminal"` → `"Quintal"` and reads the value from the adjacent `<td class="precios">` cell. If neither the date nor the price can be matched, the fallback object is returned immediately.
+</Note>

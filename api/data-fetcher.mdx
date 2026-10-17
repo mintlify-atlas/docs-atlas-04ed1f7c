@@ -1,0 +1,246 @@
+---
+title: "ERA5 Weather and NOAA ENSO Data Fetching"
+sidebarTitle: "Data Fetcher"
+description: "core/data_fetcher.py downloads daily ERA5 climate data from Open-Meteo and ENSO indices from NOAA PSL, with local disk caching and exponential-backoff retry logic."
+---
+
+`core/data_fetcher.py` is the data acquisition layer of the AGRO-JUTIAPA platform. It provides two primary download functions — `fetch_weather()` for daily ERA5 reanalysis data from Open-Meteo and `fetch_macro()` for monthly ENSO indices from NOAA PSL — plus the MAGA official maize price scraper `fetch_maga_white_corn_price()` from `core/maga_scraper.py`. Both weather and macro functions implement file-based disk caching and automatic exponential-backoff retry logic to handle rate-limiting and transient network errors gracefully.
+
+---
+
+## `fetch_weather()` Function
+
+```python
+def fetch_weather(
+    geo: GeoConfig = GEO_CONFIG,
+    cache_dir: Optional[Path] = None,
+    use_cache: bool = True,
+    force_refresh: bool = False,
+) -> pd.DataFrame
+```
+
+Downloads the complete daily ERA5 reanalysis time series for a given geographic location, starting from `geo.start_year` (default 1981) up to six days before today. Data are requested from the Open-Meteo historical archive API in 10-year chunks to respect API size limits.
+
+<ParamField path="geo" type="GeoConfig" default="GEO_CONFIG">
+  Geographic configuration providing `lat`, `lon`, `start_year`, `timezone`, `archive_url`, and `daily_vars` (the list of ERA5 variable names to request).
+</ParamField>
+
+<ParamField path="cache_dir" type="Optional[Path]" default="None">
+  Directory for the CSV cache file. Falls back to `PATH_CONFIG.cache_dir` when `None`. The cache file is named `weather_{lat:.3f}_{lon:.3f}_{start_year}.csv`.
+</ParamField>
+
+<ParamField path="use_cache" type="bool" default="True">
+  When `True`, reads from the CSV cache file if it exists and `force_refresh` is `False`. Also writes to the cache after a successful download.
+</ParamField>
+
+<ParamField path="force_refresh" type="bool" default="False">
+  When `True`, bypasses the cache read and downloads fresh data regardless of whether a cached file exists. The freshly downloaded data overwrites the existing cache file.
+</ParamField>
+
+**Returns:** `pd.DataFrame` with the following columns after renaming:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `time` | `datetime64[ns]` | Daily timestamps, one row per calendar day |
+| `precip_mm` | `float` | Daily precipitation sum (mm) — renamed from `precipitation_sum` |
+| `et0_mm` | `float` | FAO-56 reference evapotranspiration (mm) — renamed from `et0_fao_evapotranspiration` |
+| `t_mean_c` | `float` | Daily mean air temperature at 2 m (°C) — renamed from `temperature_2m_mean` |
+
+The returned DataFrame is sorted by `time`, deduplicated, and trimmed to the last row where all three core columns are non-null. Three physical integrity assertions are enforced before caching: no internal NaN gaps, no missing calendar days, and values within physical bounds (`precip_mm` in [0, 600], `et0_mm` in [0, 20]).
+
+<Note>
+  Typical data volume: **~16,000 rows** of daily weather data covering 1981 to the present (~44 years). The first download for a new coordinate takes 60–120 seconds; subsequent runs load from the CSV cache in under one second.
+</Note>
+
+---
+
+## `fetch_macro()` Function
+
+```python
+def fetch_macro(
+    macro_cfg: MacroClimateConfig = MACRO_CONFIG,
+    cache_dir: Optional[Path] = None,
+    use_cache: bool = True,
+    force_refresh: bool = False,
+) -> pd.DataFrame
+```
+
+Downloads and processes monthly ENSO climate indices from NOAA PSL, constructs lag features to prevent look-ahead bias, and returns a monthly DataFrame aligned with the ERA5 weather series.
+
+<ParamField path="macro_cfg" type="MacroClimateConfig" default="MACRO_CONFIG">
+  Provides `urls` (a dict mapping index names to their NOAA PSL text-file URLs) and the feature lists `features_full` and `features_local` used during model selection.
+</ParamField>
+
+<ParamField path="cache_dir" type="Optional[Path]" default="None">
+  Directory for the CSV cache file. Falls back to `PATH_CONFIG.cache_dir`. Cache file is always named `macro_enso_indices.csv`.
+</ParamField>
+
+<ParamField path="use_cache" type="bool" default="True">
+  Behaviour identical to `fetch_weather()`.
+</ParamField>
+
+<ParamField path="force_refresh" type="bool" default="False">
+  Behaviour identical to `fetch_weather()`.
+</ParamField>
+
+**Returns:** `pd.DataFrame` with a `DatetimeIndex` at month-start (`"MS"`) frequency and the following columns:
+
+| Column | Description |
+|--------|-------------|
+| `mei_lag1` | MEI v2 index value from one month prior to the current row — strict lag-1 to prevent look-ahead |
+| `mei_trend` | First difference of `mei_lag1`: current `mei_lag1` minus the previous month's `mei_lag1` |
+| `nino34_lag1` | Niño 3.4 SST anomaly from one month prior |
+
+Values ≤ −90.0 in the raw NOAA files (sentinel for missing data) are replaced with `NaN`.
+
+<Note>
+  Typical data volume: **~500 rows** of monthly ENSO data (1981–present). The NOAA PSL text files use a fixed-width 13-column tabular format (year + 12 monthly values). The internal `parse_psl_series()` helper melts this into a long-format monthly Series before merging.
+</Note>
+
+---
+
+## Caching Strategy
+
+Both functions use a unified file-based caching strategy with deterministic cache keys:
+
+<CardGroup cols={2}>
+  <Card title="Weather Cache" icon="cloud">
+    **File:** `weather_{lat:.3f}_{lon:.3f}_{start_year}.csv`
+
+    Stored as a UTF-8 CSV with `time` as an ISO-8601 string column. On load, `time` is re-parsed to `datetime64`. Cache is invalidated only by `force_refresh=True` or manual deletion.
+  </Card>
+  <Card title="ENSO Cache" icon="wave-square">
+    **File:** `macro_enso_indices.csv`
+
+    Stored with a `DatetimeIndex` as the first column. On load, the index is re-parsed to `DatetimeIndex`. A single cache file covers all locations since ENSO is a global index.
+  </Card>
+</CardGroup>
+
+The cache key for weather data encodes latitude, longitude (both rounded to 3 decimal places), and the start year, ensuring that requests for different locations or historical depths produce separate cache files.
+
+---
+
+## Exponential Backoff Retry Logic
+
+All HTTP requests to Open-Meteo are made through the internal `_get_json_with_retry()` helper, which implements exponential backoff specifically for HTTP 429 (Too Many Requests) responses:
+
+```python
+def _get_json_with_retry(
+    url: str,
+    params: dict,
+    retries: int = 5,
+    initial_backoff: float = 5.0,
+) -> dict
+```
+
+On receiving an HTTP 429, the function waits `initial_backoff × attempt` seconds before retrying (5 s, 10 s, 15 s, 20 s, 25 s). On any other `RequestException`, it waits `initial_backoff` seconds and retries. After `retries` failed attempts it raises a `RuntimeError`.
+
+<Tip>
+  Open-Meteo's free tier allows up to 10,000 API calls per day. Downloading 44 years of data in 10-year chunks requires approximately 5 API calls per location. Using `use_cache=True` (the default) means this cost is paid only once per coordinate.
+</Tip>
+
+NOAA PSL requests are made with a single 40-second `requests.get()` call without retry logic, since PSL text files are small (< 50 KB) and rarely rate-limited. If the NOAA server is unreachable, the exception propagates to the pipeline caller.
+
+---
+
+## `fetch_maga_white_corn_price()` Function
+
+Defined in `core/maga_scraper.py`, this function is called by the pipeline immediately before each financial projection to inject a live official maize price.
+
+```python
+def fetch_maga_white_corn_price(timeout_sec: int = 3) -> Dict[str, Any]
+```
+
+Scrapes the official MAGA daily price page (`https://precios.maga.gob.gt/diarios/diarios.html`) for the current price of *Maíz blanco, de primera* at Mercado La Terminal. Results are cached in a module-level dict for 10 minutes (`ttl_seconds=600`) to avoid saturating the MAGA server across parallel requests.
+
+<ParamField path="timeout_sec" type="int" default="3">
+  HTTP request timeout in seconds. The pipeline passes `3` to avoid blocking the analysis if the MAGA server is slow. Increase this value if you observe fallback prices being returned during periods of high MAGA server load.
+</ParamField>
+
+**Returns:** `Dict[str, Any]` with the following keys:
+
+<ResponseField name="producto" type="str">
+  Always `"Maíz blanco, de primera"`.
+</ResponseField>
+
+<ResponseField name="mercado" type="str">
+  Always `"La Terminal"` (Guatemala City wholesale market).
+</ResponseField>
+
+<ResponseField name="medida" type="str">
+  Always `"Quintal"` (1 quintal = 46 kg).
+</ResponseField>
+
+<ResponseField name="precio" type="float">
+  Official MAGA price per quintal in Guatemalan quetzales (Q). Fallback value is `235.00` Q/qq (the last verified price as of 09/10/2026).
+</ResponseField>
+
+<ResponseField name="fecha" type="str">
+  Date of the price report in `DD/MM/YYYY` format, extracted from the MAGA HTML page.
+</ResponseField>
+
+<ResponseField name="fuente" type="str">
+  Attribution string: `"MAGA Guatemala - Precios Diarios de Mercados Mayoristas"`.
+</ResponseField>
+
+<ResponseField name="estado" type="str">
+  Connection status: `"en_linea"` when a live price was successfully scraped, `"fallback"` when the MAGA server was unreachable or the expected HTML pattern was not found.
+</ResponseField>
+
+<Warning>
+  When `estado == "fallback"`, the returned price is a hardcoded reference value and may not reflect the current market. The pipeline logs a console warning and proceeds normally. Callers should check `estado` if they require guaranteed live pricing.
+</Warning>
+
+---
+
+## Usage Example
+
+```python
+from core.data_fetcher import fetch_weather, fetch_macro
+from config.settings import GEO_CONFIG, MACRO_CONFIG, PATH_CONFIG
+
+df_weather = fetch_weather(
+    geo=GEO_CONFIG,
+    cache_dir=PATH_CONFIG.cache_dir,
+    use_cache=True,
+    force_refresh=False,
+)
+print(df_weather.tail(5)[["time", "precip_mm", "et0_mm", "t_mean_c"]])
+
+df_macro = fetch_macro(
+    macro_cfg=MACRO_CONFIG,
+    cache_dir=PATH_CONFIG.cache_dir,
+)
+print(df_macro.tail(3))
+```
+
+To fetch a live MAGA price independently of the full pipeline:
+
+```python
+from core.maga_scraper import fetch_maga_white_corn_price
+
+price_data = fetch_maga_white_corn_price(timeout_sec=5)
+if price_data["estado"] == "en_linea":
+    print(f"Live MAGA price: Q {price_data['precio']:.2f}/qq ({price_data['fecha']})")
+else:
+    print(f"Fallback price: Q {price_data['precio']:.2f}/qq — MAGA server unreachable")
+```
+
+To force a full re-download of both datasets (e.g. for a scheduled nightly refresh job):
+
+```python
+df_weather = fetch_weather(
+    geo=GEO_CONFIG,
+    cache_dir=PATH_CONFIG.cache_dir,
+    use_cache=True,
+    force_refresh=True,   # Overwrite existing cache
+)
+df_macro = fetch_macro(
+    macro_cfg=MACRO_CONFIG,
+    cache_dir=PATH_CONFIG.cache_dir,
+    use_cache=True,
+    force_refresh=True,
+)
+print(f"ERA5 coverage: {df_weather['time'].iloc[0].date()} → {df_weather['time'].iloc[-1].date()}")
+print(f"ENSO records: {len(df_macro)} months")
+```

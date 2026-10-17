@@ -1,0 +1,77 @@
+---
+title: "AGRO-JUTIAPA: Open Agricultural Viability Platform"
+sidebarTitle: "Introduction"
+description: "AGRO-JUTIAPA combines ERA5 climate data, FAO-56 soil physics, and XGBoost ML to deliver calibrated sowing viability verdicts for Guatemalan farmers."
+---
+
+AGRO-JUTIAPA is an open-access agrometeorological and financial viability platform purpose-built for white maize (*Maíz Blanco de Primera*) sowing in Calderas, San José Acatempa, Jutiapa, Guatemala — a sub-region of the chronically drought-stressed Dry Corridor of Central America. The platform fuses 44 years of ERA5 reanalysis data (1981 to present), FAO-56 soil-water physics calibrated to the Jutiapa edaphic profile, and XGBoost machine learning with sigmoid probability calibration to deliver a single, actionable tri-color verdict: sow now, proceed with caution, or hold back entirely. It is designed for smallholder farmers, field agronomists, and researchers who need transparent, quantitative decision support — without logins, subscriptions, or intermediaries standing between the analyst and the predictive engine.
+
+## System Architecture
+
+The platform runs in three fully supported modes that share the same Python analytical core, making local use, automated scripting, and cloud deployment first-class citizens.
+
+| Mode | Entry Point | Best For |
+|---|---|---|
+| **Local web server** | `python server.py 8000` | Daily farm advisory, interactive PDF review |
+| **CLI (headless)** | `python main.py [args]` | Automated batch runs, integration with other tools |
+| **Vercel serverless** | `npx vercel` | Cloud deployment via `vercel.json` + `api/` endpoints |
+
+The codebase is organized into five distinct layers that are traversed in order for every analysis request:
+
+- **`front/`** — Single-page web application (HTML5 Canvas terrain plotter, Chart.js water-balance graphs, integrated PDF viewer). Serves `index.html`, `css/style.css`, and JavaScript modules `app.js`, `charts.js`, and `terrain.js`.
+- **`api/`** — Node.js serverless endpoints for Vercel: `analyze.js` handles the full agrometeorological inference and financial pipeline, while `maga-price.js` runs the real-time MAGA wholesale price scraper.
+- **`core/`** — The Python analytical engine: `data_fetcher.py` (ERA5 + NOAA downloads), `soil_balance.py` (Saxton & Rawls pedotransfer + FAO-56 bucket simulation), `rain_streak_analyzer.py` (phenological dry-spell detection including *canícula*), `models.py` (XGBoost/Logit ensemble, GroupKFold CV, CalibratedClassifierCV), `agronomy_economics.py` (geometry, planting density, P&L), `maga_scraper.py`, and `input_validator.py` (SQL/XSS/path-traversal hardening).
+- **`config/`** — Frozen dataclasses in `settings.py` that centralize every numeric constant: geographic bounding box, soil texture, FAO-56 crop coefficients, semáforo thresholds, MAGA price references, and path roots.
+- **`reporting/`** — `visualizer.py` (Matplotlib water-balance charts and terrain plans) and `pdf_exporter.py` (ReportLab three-page Letter-format official verdict document).
+
+## Data Sources
+
+Three authoritative external sources feed every analysis:
+
+**ERA5 via Open-Meteo Archive API** (`https://archive-api.open-meteo.com/v1/archive`) provides daily precipitation totals, FAO-56 Penman-Monteith reference evapotranspiration (ET₀), and 2 m mean temperature from 1981 to the present day for the exact coordinates queried. Data is persisted in a local `.cache/` directory with exponential-backoff retry logic so repeated runs do not re-download the full series.
+
+**NOAA Physical Sciences Laboratory (PSL)** supplies two global macroclimatic ENSO indices that are merged into every training sample and inference vector:
+- **MEI v2** (`https://psl.noaa.gov/data/correlation/meiv2.data`) — Multivariate ENSO Index, version 2.
+- **Niño 3.4 anomaly** (`https://psl.noaa.gov/data/timeseries/month/data/nino34.long.anom.data`) — SST anomaly in the Niño 3.4 region, used to diagnose El Niño, La Niña, and neutral phases.
+
+**MAGA DIPLAN / SIMPA** (Ministerio de Agricultura, Ganadería y Alimentación de Guatemala) provides the official daily wholesale price of white maize (*Maíz blanco, de primera*) at Mercado La Terminal in Guatemala City. The `maga_scraper.py` module fetches this price in real time at the start of each financial projection; if the scraper is unavailable the platform falls back to the reference price encoded in `config/settings.py` (`MagaPriceConfig.precio_qq_maiz_blanco = 235.0 Q/quintal`).
+
+## Open Access Model
+
+AGRO-JUTIAPA operates under an unconditional open-access philosophy. There are no user accounts, no authentication tokens, no API keys, no role-based gates, and no paywalls. Any farmer, agronomist, or researcher who can reach the server — whether running locally on a laptop or deployed on Vercel — gets immediate, full access to the predictive engine. Every analysis request triggers a complete dynamic computation: ERA5 ingestion (or cache hit), FAO-56 balance simulation, XGBoost inference with calibrated probability, terrain geometry, planting density recommendation, and the full P&L projection. Nothing is pre-computed for a specific user; everything is calculated on demand from the raw data sources.
+
+<Note>
+  Because the engine recalculates everything at request time using real ERA5 series and live MAGA prices, results for a given sowing date may differ slightly between runs if the MAGA scraper retrieves an updated wholesale price or if the ERA5 archive has been extended since the previous cache write.
+</Note>
+
+## Geographic Scope
+
+AGRO-JUTIAPA enforces a **strict geographic bounding box** around the micro-region of Calderas, San José Acatempa, Jutiapa, Guatemala. Every coordinate pair is validated by `core/input_validator.py` against the limits defined in `config/settings.py` (`ValidationConfig`), and any request outside these bounds is rejected with a `400 Validation Error` before any computation begins:
+
+| Boundary | Minimum | Maximum |
+|---|---|---|
+| **Latitude** | 14.240 ° N | 14.290 ° N |
+| **Longitude** | −90.160 ° W | −90.110 ° W |
+
+This restriction is intentional and scientific, not arbitrary. The FAO-56 soil parameters (26% clay, 52% sand, 1.8% organic matter) and the 44-year ERA5 training dataset are all calibrated to this specific edaphic and microclimatic environment. Applying the model to other locations — even nearby — would introduce unquantified bias. The default centroid coordinates used by the CLI and web interface are **Lat 14.267, Lon −90.133**.
+
+<Warning>
+  Coordinates outside the bounding box (Lat 14.240–14.290, Lon −90.160–−90.110) will be rejected by the validation layer. The platform is exclusively calibrated for the Calderas micro-region of San José Acatempa, Jutiapa, Guatemala.
+</Warning>
+
+## Explore the Platform
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install dependencies, launch the local server, and run your first analysis in under five minutes.
+  </Card>
+  <Card title="Agrometeorological Analysis" icon="cloud-sun-rain" href="/concepts/agrometeorological-analysis">
+    How ERA5 climate data, ENSO indices, and the 120-day phenological model work together.
+  </Card>
+  <Card title="Soil-Water Balance" icon="droplet" href="/concepts/soil-water-balance">
+    FAO-56 bucket simulation, Saxton & Rawls pedotransfer functions, and the Jutiapa soil profile.
+  </Card>
+  <Card title="ML Models" icon="brain" href="/concepts/ml-models">
+    XGBoost ensemble training, GroupKFold temporal cross-validation, and probability calibration.
+  </Card>
+</CardGroup>

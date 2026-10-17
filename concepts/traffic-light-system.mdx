@@ -1,0 +1,159 @@
+---
+title: "Tri-Color Agrometeorological Traffic Light System"
+sidebarTitle: "Traffic Light"
+description: "AGRO-JUTIAPA maps calibrated sowing probabilities to a Green/Yellow/Red traffic light, with ENSO-aware recommendations and 120-day phenological streak validation."
+---
+
+Every analysis run by AGRO-JUTIAPA culminates in a single, actionable verdict communicated through a tri-color traffic light — Verde (Green), Amarillo (Yellow), or Rojo (Red). The traffic light translates the output of a calibrated machine learning model into a language that is immediately meaningful to smallholder farmers in the Dry Corridor of Guatemala, who may not interpret probability values directly but can act on a clear color signal supported by concrete agronomic guidance. The final color displayed to the user is the product of three sequential layers: the raw ML probability, a phenological streak correction derived from 120-day rain series analysis, and an ENSO contextual overlay.
+
+## Probability Thresholds
+
+The base traffic light color is assigned from the calibrated sowing probability using two fixed thresholds defined in `SemaforoConfig` in `config/settings.py`:
+
+| Color | Threshold | Estado | Recommended Action |
+|---|---|---|---|
+| 🟢 **Verde** | prob ≥ **0.80** | ÓPTIMO | Condiciones hídricas altamente favorables. Proceder con la siembra en la densidad recomendada. |
+| 🟡 **Amarillo** | 0.40 ≤ prob < **0.80** | CONDICIONADO O EN ALERTA | Riesgo hídrico moderado: emplear variedades precoces o tolerantes a sequía, labranza de conservación y monitoreo de humedad. |
+| 🔴 **Rojo** | prob < **0.40** | NO SEMBRAR | Riesgo crítico de fracaso hídrico por sequía prolongada o anegamiento. |
+
+```python
+# From config/settings.py — SemaforoConfig thresholds
+@dataclass(frozen=True)
+class SemaforoConfig:
+    prob_optimo_min: float = 0.80   # Verde: prob >= 0.80
+    prob_alerta_min: float = 0.40   # Amarillo: 0.40 <= prob < 0.80
+                                    # Rojo:     prob < 0.40
+```
+
+These thresholds were calibrated empirically against 45 years of ERA5 outcomes in the Jutiapa micro-region: a probability of 0.80 or above corresponds to a historical sowing success rate exceeding 76%, while probabilities below 0.40 are associated with drought or waterlogging failure rates above 89%.
+
+## Phenological Correction
+
+After the base traffic light color is assigned from the ML probability alone, the pipeline runs `analyze_rain_streaks()` on the 120-day daily precipitation series starting from the sowing date. If this analysis detects critical water stress conditions in any of the four phenological stages, the probability and color are **downgraded** to prevent false positives — a particularly important safeguard in a subsistence farming context where an incorrect Verde recommendation can result in total crop loss.
+
+Two correction rules are applied sequentially in `pipeline.py`:
+
+<Steps>
+  <Step title="Critical Alert → Forced Red">
+    If `streak_report.overall_verdict == "NO APTO PARA SIEMBRA"` **or** the report contains any `critical_alerts` (e.g., > 7 consecutive dry days during germination, > 4 dry days during flowering, or a Severe Canícula streak), the probability is capped at **0.35** and the color is forced to **Rojo** regardless of the ML score:
+
+    ```python
+    # From pipeline.py — critical phenological override
+    if streak_report.overall_verdict == "NO APTO PARA SIEMBRA" or len(streak_report.critical_alerts) > 0:
+        prob = min(prob, 0.35)
+        estado = "NO SEMBRAR"
+        color  = "Rojo"
+        alerta_msg = streak_report.critical_alerts[0] if streak_report.critical_alerts else \
+                     "Falla crítica por rachas hídricas en fases fenológicas cardinales."
+        accion = f"DICTAMEN ADVERSO (Fallo Fenológico): {alerta_msg}. No se recomienda siembra a temporal."
+    ```
+  </Step>
+  <Step title="Precautionary Verdict → Green Downgraded to Yellow">
+    If `streak_report.overall_verdict == "SIEMBRA CON PRECAUCIÓN"` and the base ML color was Verde, the color is downgraded to **Amarillo** and the probability is capped at **0.74** — just below the Verde threshold of 0.80:
+
+    ```python
+    # From pipeline.py — precautionary downgrade from Verde to Amarillo
+    elif streak_report.overall_verdict == "SIEMBRA CON PRECAUCIÓN":
+        if color == "Verde":
+            color  = "Amarillo"
+            estado = "CONDICIONADO O EN ALERTA"
+            prob   = min(prob, 0.74)
+            issue_msg = streak_report.stages[0].issues[0] if (
+                streak_report.stages and streak_report.stages[0].issues
+            ) else "Riesgo moderado de canícula o déficit."
+            accion = f"CONDICIONADO: {issue_msg}. Adoptar variedades precoces y técnicas de retención de humedad."
+    ```
+
+    A base Amarillo or Rojo verdict is **never upgraded** by the streak analysis — it can only downgrade.
+  </Step>
+</Steps>
+
+<Warning>
+  The phenological correction is asymmetric by design: the streak analysis can only lower the final color, never raise it. A date with a low ML probability but a clean rain distribution remains Rojo. This conservative behavior is intentional — AGRO-JUTIAPA prioritizes avoiding false Verde recommendations over avoiding false Rojo recommendations in the Dry Corridor context.
+</Warning>
+
+## ENSO Context
+
+The ENSO phase is determined from the `mei_lag1` feature (MEI v2 of the previous month) using the `enso_phase()` function in `core/models.py`:
+
+```python
+# From core/models.py — ENSO phase classification
+def enso_phase(mei: float) -> str:
+    if pd.isna(mei):
+        return "N/D"
+    if mei >= 0.5:
+        return "El Niño"
+    elif mei <= -0.5:
+        return "La Niña"
+    return "Neutral"
+```
+
+The ENSO phase is **displayed alongside the traffic light verdict** as context for the farmer and extension agent, but it does not override the probability threshold logic. Its influence enters the prediction indirectly through the `mei_lag1` and `mei_trend` features in the `local+ENSO` model configurations.
+
+<CardGroup cols={3}>
+  <Card title="El Niño" icon="sun">
+    MEI v2 ≥ 0.5 — Suppressed rainfall in the Guatemalan Dry Corridor. Historical ERA5 records for Jutiapa show reduced May–October precipitation during El Niño years, increasing the likelihood of Rojo verdicts during the primera season.
+  </Card>
+  <Card title="La Niña" icon="cloud-rain">
+    MEI v2 ≤ −0.5 — Enhanced convective activity over Central America. May increase total precipitation but also raise the risk of waterlogging events and prolonged wet streaks that trigger the phenological excess-rain alerts.
+  </Card>
+  <Card title="Neutral" icon="equals">
+    −0.5 < MEI v2 < 0.5 — Baseline ENSO forcing. Local mesoscale factors (terrain, elevation, sea-breeze cycles) dominate the rainfall regime. Most climatologically "average" sowing seasons in Calderas fall within this phase.
+  </Card>
+</CardGroup>
+
+## 120-Day Phenological Stages
+
+The phenological streak analysis evaluates the full 120-day crop cycle in four stages, each with specific hydrological requirements and failure thresholds calibrated for white maize in Calderas:
+
+| Stage | Days | Water Requirement | Key Failure Condition |
+|---|---|---|---|
+| Germinación y Emergencia | Days 1–15 | 20–40 mm | > 7 consecutive days < 1 mm/day (seed desiccation) or > 5 consecutive days > 15 mm/day (seed rot) |
+| Desarrollo Vegetativo | Days 16–55 | 150–250 mm | > 10 consecutive days < 1.5 mm/day (stunting) or > 8 consecutive days > 20 mm/day (root anoxia) |
+| Floración y Polinización ⚠️ | Days 56–75 | 80–120 mm | > 4 consecutive days < 2 mm/day (pollen desiccation, 6–10% yield loss per day) |
+| Llenado de Grano y Maduración | Days 76–120 | 150–250 mm | > 6 consecutive days < 1.5 mm/day in days 76–95 (grain abortion) |
+
+**Flowering (Days 56–75) is the most critical stage** for water stress. The maize pollen viability window is extremely narrow: consecutive dry days with precipitation below 2 mm cause rapid pollen desiccation, stigma drying, and asynchrony between silk emergence and pollen shed. Each additional dry day during flowering is associated with an estimated **6–10% yield penalty** on the final grain fill. This is why the flowering stage carries the highest weight in the overall risk scoring (`0.40` of the composite risk score vs. `0.15` for germination, `0.25` for vegetative, and `0.20` for grain fill).
+
+<Note>
+  The flowering stage failure threshold uses a stricter dry-day criterion (< 2 mm/day, not the 1.5 mm/day used in other stages) because even a light shower of 1.5–2 mm is sufficient to sustain pollen viability and maintain stigma receptivity during the critical pollination window.
+</Note>
+
+## Canícula Detection
+
+The canícula is the **mid-summer dry spell** characteristic of the Central American monsoon system, occurring most frequently in **July and August** in Jutiapa. It is detected by finding the longest consecutive-dry-day streak (< 1.5 mm/day) within the July–August window that overlaps the 120-day cycle:
+
+```python
+# From core/rain_streak_analyzer.py — canícula severity thresholds
+if can_streak >= 15:
+    canicula_severity = "Severa"    # Critical — added to critical_alerts
+elif can_streak >= 9:
+    canicula_severity = "Moderada"  # Triggers SIEMBRA CON PRECAUCIÓN
+elif can_streak >= 5:
+    canicula_severity = "Leve"      # Advisory warning
+else:
+    canicula_severity = "Ninguna"   # No canícula detected
+```
+
+| Severity | Consecutive Dry Days | Impact | Pipeline Effect |
+|---|---|---|---|
+| Ninguna | < 5 days | No significant mid-summer stress | None |
+| Leve | 5–8 days | Mild vegetative stress, possible stunting | Advisory note; −0.05 to overall risk score |
+| Moderada | 9–14 days | Pronounced vegetative and early flowering stress | SIEMBRA CON PRECAUCIÓN verdict; −0.10 to score |
+| Severa | ≥ 15 days | Critical — can span entire flowering window | Added to `critical_alerts`; forces Rojo; −0.20 to score |
+
+A Severe Canícula (`can_streak ≥ 15`) is always added to `critical_alerts`, which triggers the **Forced Red** phenological correction described above.
+
+## Sowing Density Recommendations
+
+The traffic light color is directly linked to the recommended planting density, balancing productive potential against hydrological risk. Denser planting maximizes yield in favorable years but increases competition for scarce water in stressed conditions:
+
+| Traffic Light | Density | Rationale |
+|---|---|---|
+| 🟢 **Verde** | **5.8 plants/m²** | Full productive potential; adequate water supply supports high stand density through pollination |
+| 🟡 **Amarillo** | **4.4 plants/m²** | Reduced competition for soil water during potential dry spells; maintains economically viable yield |
+| 🔴 **Rojo** | **3.6 plants/m²** | Minimum viable density; reduces total water demand per unit area to extend survival during prolonged drought |
+
+<Tip>
+  These density values feed directly into the seed quantity and financial calculations. At 88% germination rate and 92% field survival, a Verde recommendation on a 7,000 m² parcel (1 manzana) requires approximately 46,060 viable seeds — just under one commercial bag of 60,000 seeds, accounting for replanting reserves.
+</Tip>

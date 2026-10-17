@@ -1,0 +1,110 @@
+{
+  "projectType": "saas",
+  "projectName": "AGRO-JUTIAPA",
+  "projectDescription": "An open-access agrometeorological and financial viability platform that uses ERA5 climate reanalysis, FAO-56 soil water balance, and XGBoost machine learning to evaluate white maize sowing viability in Calderas, San José Acatempa, Jutiapa, Guatemala.",
+  "theme": "palm",
+  "primaryColor": "#15241c",
+  "lightColor": "#fafaf7",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/agrometeorological-analysis",
+              "concepts/soil-water-balance",
+              "concepts/ml-models",
+              "concepts/traffic-light-system"
+            ]
+          },
+          {
+            "group": "Usage Guides",
+            "pages": [
+              "guides/web-interface",
+              "guides/cli",
+              "guides/deployment"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/settings",
+              "configuration/input-validation"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "REST Endpoints",
+            "pages": [
+              "api/overview",
+              "api/analyze",
+              "api/maga-price"
+            ]
+          },
+          {
+            "group": "Python Modules",
+            "pages": [
+              "api/pipeline",
+              "api/soil-balance",
+              "api/agronomy-economics",
+              "api/rain-streak-analyzer",
+              "api/data-fetcher"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "ERA5 satellite reanalysis data ingestion from 1981 to present (Open-Meteo Archive API)",
+    "FAO-56 continuous soil water balance simulation (Saxton & Rawls pedotransfer equations)",
+    "XGBoost and Logistic Regression ensemble with temporal GroupKFold cross-validation",
+    "Calibrated probability output with Brier Skill Score validation against local climatology",
+    "Tri-color agrometeorological traffic light (Green / Yellow / Red) for sowing decisions",
+    "ENSO phase detection (El Niño / La Niña / Neutral) via NOAA PSL MEI v2",
+    "120-day phenological rain streak analysis with canícula (dry spell) detection",
+    "Geometric terrain modeling for rectangular, triangular, and irregular quadrilateral parcels",
+    "Dynamic sowing density recommendations (5.8, 4.4, or 3.6 plants/m²) based on risk level",
+    "Real-time MAGA wholesale maize price scraper (La Terminal market, Guatemala City)",
+    "Full P&L financial projection with ROI, break-even, and three-scenario sensitivity analysis",
+    "Structured PDF report export with interactive browser viewer",
+    "Input hardening against SQL injection, XSS, and path traversal attacks",
+    "Strict geographic restriction to Calderas, San José Acatempa, Jutiapa bounding box"
+  ],
+  "publicApiSurface": [
+    "POST /api/analyze",
+    "GET /api/maga-price",
+    "AgroViabilityPipeline.run()",
+    "validate_and_sanitize()",
+    "TerrainModel",
+    "calculate_sowing_density()",
+    "calculate_financial_projection()",
+    "analyze_rain_streaks()",
+    "fetch_weather()",
+    "fetch_macro()",
+    "fetch_maga_white_corn_price()",
+    "SoilProfile",
+    "build_dataset()",
+    "make_xgb()",
+    "make_logit()",
+    "cross_validate()",
+    "train_calibrated_model()",
+    "semaforo()",
+    "enso_phase()",
+    "proyectar_futuro()"
+  ]
+}

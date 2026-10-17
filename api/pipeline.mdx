@@ -1,0 +1,319 @@
+---
+title: "AgroViabilityPipeline: Orchestrating the Full Analysis"
+sidebarTitle: "Pipeline"
+description: "AgroViabilityPipeline.run() executes all five analysis steps — data download, soil balance, model CV, inference, and PDF generation — and returns a PipelineResult dataclass."
+---
+
+`AgroViabilityPipeline` is the central orchestrator of the AGRO-JUTIAPA platform. A single call to `run()` coordinates every subsystem — ERA5 climate acquisition, FAO-56 soil water balance, GroupKFold cross-validation, ENSO-aware inference, terrain geometry, financial projection, rain streak phenological analysis, and PDF export — and returns a fully populated `PipelineResult` dataclass. The pipeline is designed for both one-shot CLI execution and low-latency web-server deployments, using an in-memory model cache to avoid redundant computation across repeated requests for the same geographic location.
+
+## AgroViabilityPipeline Class
+
+The constructor accepts seven configuration dataclasses. All have module-level singleton defaults drawn from `config.settings`, so an unparameterised `AgroViabilityPipeline()` targets the canonical study area: Calderas, San José Acatempa, Jutiapa, Guatemala (14.267 °N, −90.133 °E).
+
+<ParamField path="geo_cfg" type="GeoConfig" default="GEO_CONFIG">
+  Geographic configuration: coordinates (`lat`, `lon`), ERA5 archive start year, timezone string, and municipality name. Passed directly to `fetch_weather()`.
+</ParamField>
+
+<ParamField path="agro_cfg" type="AgroConfig" default="AGRO_CONFIG">
+  Agronomic simulation parameters: `window_days` (60), `kc_curve` (daily crop-coefficient array), `fallow_kc`, `fallow_root_mm`, `crop_root_mm`, `sowing_months`, `spinup_days`, `eta_etc_min`, `excess_mm_day`, and `waterlog_max_days`.
+</ParamField>
+
+<ParamField path="soil_cfg" type="SoilConfig" default="SOIL_CONFIG">
+  Pedological parameters: `clay_pct`, `sand_pct`, `om_pct` (organic matter), and `p_depletion` (RAW fraction of TAW). These feed the Saxton & Rawls pedotransfer equations in `SoilProfile`.
+</ParamField>
+
+<ParamField path="macro_cfg" type="MacroClimateConfig" default="MACRO_CONFIG">
+  ENSO macro-climate settings: NOAA PSL `urls` dict, `features_full` and `features_local` feature lists used during model selection.
+</ParamField>
+
+<ParamField path="maga_cfg" type="MagaPriceConfig" default="MAGA_CONFIG">
+  Official MAGA maize price configuration: `precio_qq_maiz_blanco` (Q/quintal), `rendimiento_base_qq_mz` (65 qq/mz), `fecha_actualizacion`, and `fuente_oficial`. The pipeline attempts a live scrape before each financial projection and mutates this config if a fresh price is found.
+</ParamField>
+
+<ParamField path="semaforo_cfg" type="SemaforoConfig" default="SEMAFORO_CONFIG">
+  Traffic-light thresholds: `prob_optimo_min` (Verde) and `prob_alerta_min` (Amarillo). Probabilities below `prob_alerta_min` trigger the Rojo state.
+</ParamField>
+
+<ParamField path="path_cfg" type="PathConfig" default="PATH_CONFIG">
+  Filesystem paths: `cache_dir` for ERA5 / ENSO pickle files and `output_dir` for charts and the PDF report.
+</ParamField>
+
+### In-Memory Model Cache
+
+`AgroViabilityPipeline` exposes a class-level dictionary `_cache_store` keyed by `(round(lat, 3), round(lon, 3))`. Once a location's ERA5 dataset, calibrated model, feature set, CV results, and training DataFrame have been computed, they are stored in this dict and reused on every subsequent `run()` call for the same coordinates — regardless of which `AgroViabilityPipeline` instance makes the request.
+
+<Note>
+  The cache is never persisted to disk. It lives only for the duration of the Python process. Pass `force_refresh=True` to invalidate it explicitly, or restart the process.
+</Note>
+
+---
+
+## `run()` Method
+
+`run()` is the single public entry point. It validates inputs, conditionally repopulates the cache, runs inference for the requested sowing date, performs terrain and financial calculations, executes the rain streak analysis, generates charts, and optionally exports a PDF report.
+
+```python
+def run(
+    self,
+    sowing_date_str: str = "2026-06-01",
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    shape_type: str = "rectangulo",
+    terrain_sides: Optional[List[float]] = None,
+    terrain_width_m: float = 100.0,
+    terrain_length_m: float = 70.0,
+    capital_disponible_q: float = 6500.0,
+    tipo_maiz: str = "blanco",
+    use_cache: bool = True,
+    force_refresh: bool = False,
+    generate_pdf: bool = True,
+) -> PipelineResult
+```
+
+<ParamField path="sowing_date_str" type="str" default='"2026-06-01"'>
+  ISO-8601 date string (`YYYY-MM-DD`). If the date lies within the historical ERA5 record the pipeline uses real observed data; if it is in the future it falls back to day-of-year climatological medians derived from the 45-year ERA5 reanalysis.
+</ParamField>
+
+<ParamField path="lat" type="Optional[float]" default="None">
+  WGS-84 latitude in decimal degrees. If `None`, the pipeline uses `geo_cfg.lat`. The value is validated and rounded to 3 decimal places before cache lookup.
+</ParamField>
+
+<ParamField path="lon" type="Optional[float]" default="None">
+  WGS-84 longitude in decimal degrees. If `None`, the pipeline uses `geo_cfg.lon`.
+</ParamField>
+
+<ParamField path="shape_type" type="str" default='"rectangulo"'>
+  Parcel geometry type. Accepted values: `"rectangulo"`, `"cuadrilatero"`, `"triangulo"`, `"poligono"`. Controls the area formula applied in `TerrainModel`.
+</ParamField>
+
+<ParamField path="terrain_sides" type="Optional[List[float]]" default="None">
+  Side lengths in metres. For `"rectangulo"` provide 4 equal pairs; for `"cuadrilatero"` provide 4 unequal values `[N, E, S, W]`; for `"triangulo"` provide 3 values `[a, b, c]`. If `None`, `terrain_width_m` and `terrain_length_m` are used to synthesise the list.
+</ParamField>
+
+<ParamField path="terrain_width_m" type="float" default="100.0">
+  Parcel width in metres. Used when `terrain_sides` is `None`.
+</ParamField>
+
+<ParamField path="terrain_length_m" type="float" default="70.0">
+  Parcel length in metres. Used when `terrain_sides` is `None`.
+</ParamField>
+
+<ParamField path="capital_disponible_q" type="float" default="6500.0">
+  Total investment capital in Guatemalan quetzales (Q). Passed verbatim to `calculate_financial_projection()` — no budget line items are added or assumed.
+</ParamField>
+
+<ParamField path="tipo_maiz" type="str" default='"blanco"'>
+  Maize type. Currently only `"blanco"` (white maize, *primera*) is supported with official MAGA price data.
+</ParamField>
+
+<ParamField path="use_cache" type="bool" default="True">
+  When `True`, both the in-memory model cache and the on-disk ERA5/ENSO CSV caches are consulted before downloading.
+</ParamField>
+
+<ParamField path="force_refresh" type="bool" default="False">
+  When `True`, bypasses both the in-memory model cache (`_cache_store`) and the on-disk file cache, forcing a full re-download and re-training cycle.
+</ParamField>
+
+<ParamField path="generate_pdf" type="bool" default="True">
+  When `True`, a multi-page PDF technical report is exported to `path_cfg.output_dir / "Informe_Viabilidad_Maiz_Jutiapa.pdf"`. The path is returned in `PipelineResult.report_pdf_path`.
+</ParamField>
+
+---
+
+## Pipeline Steps
+
+`run()` executes the following ten internal steps in order. Steps 1–4 are skipped on a cache hit (when `use_cache=True` and `force_refresh=False` and the location key is already in `_cache_store`).
+
+<Steps>
+  <Step title="Step 1 — Input Validation">
+    `validate_and_sanitize()` from `core/input_validator.py` enforces type coercion, geographic bounds, shape consistency, and capital limits. Any out-of-range values are clamped and logged as `capital_warnings`. The validated struct is used for all subsequent computation.
+  </Step>
+
+  <Step title="Step 2 — ERA5 Weather Fetch">
+    `fetch_weather()` downloads the full daily ERA5 reanalysis series (precipitation, ET₀, mean temperature) from 1981 to six days before today via the Open-Meteo archive API. Data are chunked in 10-year blocks and cached locally as a CSV file keyed by `(lat, lon, start_year)`.
+  </Step>
+
+  <Step title="Step 3 — ENSO Indices Fetch">
+    `fetch_macro()` downloads monthly MEI v2 and Niño 3.4 anomaly series from NOAA PSL, constructs lag-1 and trend features (`mei_lag1`, `mei_trend`, `nino34_lag1`), and caches the result as `macro_enso_indices.csv`. Strict one-month lag prevents any look-ahead bias.
+  </Step>
+
+  <Step title="Step 4 — FAO-56 Dataset Construction">
+    `build_dataset()` integrates ERA5 weather and ENSO indices into a single daily DataFrame. It computes antecedent soil moisture with a bucket simulation (`bucket_series`), rolling precipitation accumulations (15-day, 30-day), a 30-day water balance, dry-spell lengths, and sinusoidal day-of-year features. For every historical sowing-month date it simulates the 60-day crop window (`simulate_window`) and assigns the binary `target` label (1 = viable, 0 = drought or waterlogging failure).
+  </Step>
+
+  <Step title="Step 5 — GroupKFold CV and Model Selection">
+    Four configurations are cross-validated with 5-fold `GroupKFold` grouped by calendar year, producing out-of-fold (OOF) predictions that respect temporal ordering: `"Logística local"`, `"Logística local+ENSO"`, `"XGBoost local"`, `"XGBoost local+ENSO"`. Each is scored by AUC and Brier Skill Score (BSS). The configuration with the highest BSS is selected as `best_model_name`. The winner is then re-trained on the full dataset with sigmoid calibration (`CalibratedClassifierCV`) and stored in `_cache_store`.
+  </Step>
+
+  <Step title="Step 6 — Inference for the Requested Date">
+    If the sowing date is present in the historical ERA5 record, the calibrated model predicts directly from the observed feature vector. For future dates, a seasonal climatological vector is constructed from historical day-of-year medians combined with the latest available ENSO signal. The resulting probability drives `enso_phase()` and `semaforo()` to produce `fase_enso`, `semaforo_color`, `semaforo_estado`, and `semaforo_accion`.
+  </Step>
+
+  <Step title="Step 7 — Terrain Model and Sowing Density">
+    A `TerrainModel` is instantiated from `shape_type`, `terrain_sides`, `terrain_width_m`, and `terrain_length_m`. Its `area_m2`, `manzanas`, and `hectareas` properties are computed. `calculate_sowing_density()` then derives plant population, seed requirement, commercial bags, and row spacing from the traffic-light colour.
+  </Step>
+
+  <Step title="Step 8 — Financial Projection">
+    The pipeline attempts a live MAGA price scrape (`fetch_maga_white_corn_price`). If successful, `maga_cfg.precio_qq_maiz_blanco` is updated in place. `calculate_financial_projection()` then builds the P&L statement, ROI, break-even point, and three sensitivity scenarios (Optimista +15 %, Proyectado, Pesimista −55 %) using the validated capital and current MAGA price.
+  </Step>
+
+  <Step title="Step 9 — Rain Streak and Phenological Analysis">
+    A 120-day daily rainfall series is extracted (or synthesised from day-of-year climatology for future dates). `analyze_rain_streaks()` evaluates all four maize phenological stages, detects the canícula dry spell, and returns a `RainStreakReport`. If the report contains critical alerts or a `"NO APTO PARA SIEMBRA"` verdict, the probability is capped at 0.35, the traffic light is forced to Rojo, and an adversarial action message is prepended.
+  </Step>
+
+  <Step title="Step 10 — Chart Generation and PDF Export">
+    Three Matplotlib charts are saved: water balance window (`balance_hidrico_siembra.png`), terrain layout schematic (`plano_terreno.png`), and model calibration curve (`calibracion_modelo.png`). If `generate_pdf=True`, `export_pdf_report()` assembles all results, charts, and the rain streak section into a multi-page PDF at `path_cfg.output_dir / "Informe_Viabilidad_Maiz_Jutiapa.pdf"`.
+  </Step>
+</Steps>
+
+---
+
+## `PipelineResult` Dataclass
+
+`PipelineResult` is the immutable return value of `run()`. Every field is documented below.
+
+<ResponseField name="success" type="bool">
+  Always `True` on a completed run. A `False` value (or an exception) indicates a fatal error.
+</ResponseField>
+
+<ResponseField name="sowing_date" type="str">
+  The ISO-8601 sowing date string after validation (e.g. `"2026-06-01"`).
+</ResponseField>
+
+<ResponseField name="lat" type="float">
+  Active latitude used for ERA5 queries, after validation and possible substitution from `geo_cfg`.
+</ResponseField>
+
+<ResponseField name="lon" type="float">
+  Active longitude used for ERA5 queries.
+</ResponseField>
+
+<ResponseField name="probabilidad" type="float">
+  Calibrated viability probability in `[0, 1]`. May be post-hoc capped to `≤ 0.35` by the rain streak adversarial correction or `≤ 0.74` for conditional downgrades.
+</ResponseField>
+
+<ResponseField name="semaforo_estado" type="str">
+  Traffic-light state label: `"ÓPTIMO"`, `"CONDICIONADO O EN ALERTA"`, or `"NO SEMBRAR"`.
+</ResponseField>
+
+<ResponseField name="semaforo_color" type="str">
+  Traffic-light colour: `"Verde"`, `"Amarillo"`, or `"Rojo"`.
+</ResponseField>
+
+<ResponseField name="semaforo_accion" type="str">
+  Recommended management action text. Extended with a phenological failure message when a rain streak critical alert is triggered.
+</ResponseField>
+
+<ResponseField name="fase_enso" type="str">
+  ENSO phase derived from MEI lag-1: `"El Niño"`, `"La Niña"`, `"Neutral"`, or `"N/D"` when data is unavailable.
+</ResponseField>
+
+<ResponseField name="terreno" type="TerrainModel">
+  The instantiated `TerrainModel` dataclass for the requested parcel. Exposes `area_m2`, `manzanas`, `hectareas`, `perimetro_m`, `descripcion_forma`, and `get_polygon_vertices()`.
+</ResponseField>
+
+<ResponseField name="densidad" type="Dict[str, Any]">
+  Output of `calculate_sowing_density()`. Keys include `densidad_plantas_m2`, `plantas_totales_predio`, `semillas_totales_requeridas`, `bolsas_comerciales`, `libras_semilla`, `distancia_surcos_cm`, `distancia_posturas_cm`, and `diagnostico_densidad`.
+</ResponseField>
+
+<ResponseField name="financiero" type="Dict[str, Any]">
+  Output of `calculate_financial_projection()`. Keys include `precio_maga_qq`, `capital_inversion_q`, `rendimiento_estimado_qq_mz`, `produccion_total_estimada_qq`, `ingreso_bruto_q`, `utilidad_neta_q`, `roi_pct`, `punto_equilibrio_qq`, `inversion_por_quintal_q`, `pnl_items`, and `escenarios_sensibilidad`.
+</ResponseField>
+
+<ResponseField name="proyecciones_futuras" type="List[Dict[str, Any]]">
+  Five-month forward viability projections from `proyectar_futuro()`. Each dict contains `fecha`, `mes_nombre`, `probabilidad`, `estado`, `color`, `accion`, and `fase_enso`.
+</ResponseField>
+
+<ResponseField name="cv_results" type="Dict[str, Any]">
+  Cross-validation metrics for all four model configurations. Each key maps to a dict with `auc`, `bss`, `brier_score`, `brier_clim`, and `oof` (out-of-fold probability array).
+</ResponseField>
+
+<ResponseField name="mejor_modelo" type="str">
+  Name of the best-performing model configuration selected by BSS (e.g. `"XGBoost local+ENSO"`).
+</ResponseField>
+
+<ResponseField name="chart_paths" type="Dict[str, Any]">
+  File paths for the three generated charts: keys `"water_balance"`, `"terrain"`, and `"calibration"`.
+</ResponseField>
+
+<ResponseField name="timeline" type="Dict[str, Any]">
+  60-day agrometeorological time series for chart rendering. Keys: `days` (1–60 integers), `precipDaily`, `precipAcc`, `etcAcc`, `soilFrac`. Contains real observed data or day-of-year climatological medians for future dates.
+</ResponseField>
+
+<ResponseField name="criterios_algoritmo" type="Dict[str, Any]">
+  The exact agronomic thresholds used during this run: `eta_etc_min`, `excess_mm_day`, `waterlog_max_days`, `ventana_dias`, `fallow_kc`, `suelo_textura`, `prob_optimo_min`, `prob_alerta_min`.
+</ResponseField>
+
+<ResponseField name="evaluacion_historica" type="Dict[str, Any]">
+  Observed outcome for the sowing date, when it falls within the historical record and has a completed 60-day window. Fields: `disponible`, `eta_etc_real`, `dias_anegamiento_real`, `fallo_sequia`, `fallo_exceso`, `resultado_real` (`"VIABLE"` / `"FRACASO"`), `motivo_fallo`, `nota_discrepancia`.
+</ResponseField>
+
+<ResponseField name="report_pdf_path" type="Optional[str]">
+  Absolute path to the exported PDF report, or `None` when `generate_pdf=False`.
+</ResponseField>
+
+<ResponseField name="capital_warnings" type="List[str]">
+  Human-readable warnings produced by input validation when `capital_disponible_q` is outside advised bounds.
+</ResponseField>
+
+<ResponseField name="validation_summary" type="Dict[str, Any]">
+  Structured summary of all input sanitization actions, produced by `get_validation_summary()`.
+</ResponseField>
+
+<ResponseField name="rain_streak_report" type="Optional[Dict[str, Any]]">
+  Serialisable dict produced by `generate_streak_pdf_section()`. Contains `veredicto_general`, `puntaje_riesgo`, `tabla_etapas`, `canicula`, `alertas_criticas`, `resumen_ejecutivo`, and `directiva_agronomica`.
+</ResponseField>
+
+---
+
+## Memory Cache
+
+The class-level `_cache_store` dictionary stores the most expensive intermediate results so that subsequent `run()` calls for the same location return in milliseconds instead of minutes.
+
+**Cache key:** `(round(lat, 3), round(lon, 3))` — coordinates are rounded to three decimal places (~111 m resolution) before lookup.
+
+**Cached values per key:** `(ds, calibrated_model, feats_best, best_model_name, cv_res, train_df)` — the full daily ERA5+ENSO dataset, the fitted `CalibratedClassifierCV` model, the winning feature list, the model name, all CV metrics, and the cleaned training DataFrame.
+
+**Invalidation:** The cache is never written to disk. It is cleared when the Python process terminates or explicitly bypassed with `force_refresh=True`.
+
+<Tip>
+  In a multi-worker web server (e.g. Gunicorn with multiple processes), each worker maintains its own independent `_cache_store`. If warm-up latency matters, send one priming request per worker after startup.
+</Tip>
+
+---
+
+## Usage Example
+
+```python
+from pipeline import AgroViabilityPipeline
+
+pipeline = AgroViabilityPipeline()
+result = pipeline.run(
+    sowing_date_str="2026-06-01",
+    lat=14.267,
+    lon=-90.133,
+    shape_type="cuadrilatero",
+    terrain_sides=[100.0, 70.0, 90.0, 65.0],
+    capital_disponible_q=7200.0,
+    generate_pdf=True,
+)
+print(f"Probability: {result.probabilidad:.1%}")
+print(f"Verdict: {result.semaforo_color} — {result.semaforo_estado}")
+print(f"PDF: {result.report_pdf_path}")
+```
+
+On a second call with the same `lat`/`lon` (and `force_refresh=False`), the model is served from `_cache_store` and only the date-specific inference, terrain, and financial calculations are re-executed:
+
+```python
+# Instant re-inference for a different date — model training is skipped
+result2 = pipeline.run(
+    sowing_date_str="2026-07-15",
+    lat=14.267,
+    lon=-90.133,
+    capital_disponible_q=5000.0,
+    generate_pdf=False,
+)
+print(f"July viability: {result2.probabilidad:.1%}  [{result2.semaforo_color}]")
+print(f"ENSO phase: {result2.fase_enso}")
+print(f"Best model: {result2.mejor_modelo}")
+```

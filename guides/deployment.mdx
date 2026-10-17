@@ -1,0 +1,152 @@
+---
+title: "Deploy AGRO-JUTIAPA: Local Server and Vercel Serverless"
+sidebarTitle: "Deployment"
+description: "Two deployment options for AGRO-JUTIAPA: a Python multithreaded local server for production-local use, and Vercel serverless for public hosting with Node.js endpoints."
+---
+
+AGRO-JUTIAPA ships with two ready-to-use deployment modes. The **local Python server** (`server.py`) runs the full ML pipeline, generates PDFs, and serves the SPA from a multithreaded `ThreadedHTTPServer` — ideal for on-premises installations, agricultural extension offices, or development. The **Vercel serverless deployment** exposes the same REST API surface via Node.js edge functions (`api/analyze.js` and `api/maga-price.js`), enabling zero-infrastructure public hosting at the cost of a simplified JavaScript implementation that does not include the Python ML pipeline or PDF generation.
+
+## Local Python Server (Recommended)
+
+The local server is the recommended path for any scenario where full ML inference, ReportLab PDF generation, or high-throughput batch analysis is required.
+
+### Starting the Server
+
+```bash
+python server.py 8000
+```
+
+On startup the server initializes `AgroViabilityPipeline` and caches the instance in the module-level `PIPELINE_INSTANCE` variable. Subsequent requests reuse this instance, eliminating pipeline construction overhead after the first request and delivering ultra-low latency on all subsequent calls.
+
+To use a different port, pass it as the first positional argument:
+
+```bash
+python server.py 9000
+```
+
+### Request Routing
+
+The `AgroServerHandler` class (a subclass of `SimpleHTTPRequestHandler`) implements the following routing logic:
+
+| Method | Path | Handler |
+|---|---|---|
+| `GET` | `/api/maga-price` | Calls `core.maga_scraper.fetch_maga_white_corn_price()` and returns JSON |
+| `GET` | `/output/*` | Serves files from the `output/` directory (PDF, PNG charts) |
+| `GET` | `/*` | Serves static files from the `front/` directory; `/` maps to `front/index.html` |
+| `POST` | `/api/analyze` | Validates input, runs `PIPELINE_INSTANCE.run(...)`, returns full JSON response |
+| `OPTIONS` | `*` | Preflight CORS handler — returns `Access-Control-Allow-Origin: *` |
+
+### Security: Request Body Limit
+
+All `POST /api/analyze` requests are checked against a hard-coded size limit before the body is parsed:
+
+```python
+MAX_REQUEST_BODY_BYTES = 10 * 1024  # 10 KB
+```
+
+Requests exceeding 10 KB receive an HTTP 413 response with a descriptive JSON error. This prevents DoS attacks via oversized payloads.
+
+### CORS Headers
+
+Every API response (both `GET /api/maga-price` and `POST /api/analyze`) includes:
+
+```
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: POST, GET, OPTIONS
+Access-Control-Allow-Headers: Content-Type
+```
+
+This makes it safe to call the local server from any browser origin during development.
+
+### Pipeline Instance Cache
+
+The `PIPELINE_INSTANCE` global is initialized at server startup:
+
+```python
+try:
+    from pipeline import AgroViabilityPipeline
+    PIPELINE_INSTANCE = AgroViabilityPipeline()
+except Exception as e:
+    print(f"[Aviso] No se pudo inicializar AgroViabilityPipeline al inicio: {e}")
+    PIPELINE_INSTANCE = None
+```
+
+If initialization fails at startup (e.g., a missing dependency), the server still starts and re-attempts initialization on the first API request. On subsequent requests the cached instance is reused from memory.
+
+## Vercel Serverless Deployment
+
+For public hosting without managing a server, deploy directly to Vercel using the included configuration.
+
+### Deploy Command
+
+```bash
+npx vercel
+```
+
+Vercel auto-detects the `vercel.json` configuration and deploys the `api/` functions as serverless Node.js endpoints.
+
+### vercel.json Structure
+
+The `vercel.json` at the project root defines URL rewrites that map the same API surface used by the local server:
+
+```json
+{
+  "version": 2,
+  "cleanUrls": true,
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
+    },
+    {
+      "source": "/",
+      "destination": "/front/index.html"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/front/$1"
+    }
+  ]
+}
+```
+
+- `/api/*` requests are routed to the corresponding file in `api/` (e.g., `/api/analyze` → `api/analyze.js`).
+- The root `/` serves `front/index.html`, the SPA entry point.
+- All other paths (`/css/style.css`, `/js/app.js`, etc.) are rewritten to `front/<path>`, serving the static SPA assets.
+
+### Vercel Functions
+
+Two Node.js serverless functions are included:
+
+<CardGroup cols={2}>
+  <Card title="api/analyze.js" icon="bolt">
+    **POST /api/analyze** — Handles the full analysis request. Validates geographic coordinates against the Calderas bounding box (lat 14.240–14.290, lon -90.160–-90.110), computes parcel geometry (Heron's formula for triangles, trapezoid approximation for quadrilaterals), fetches live weather data from Open-Meteo (92 days observed + 14-day ECMWF forecast), runs the 60-day FAO-56 bucket simulation, applies the embedded JS logistic model coefficients calibrated on 45 years of ERA5 data, computes planting density and the P&L financial projection using the live MAGA price, and returns the complete JSON response including the 120-day fenological streak table.
+  </Card>
+  <Card title="api/maga-price.js" icon="tag">
+    **GET /api/maga-price** — Scrapes the live wholesale price of *Maíz blanco, de primera* from the MAGA SIMPA portal (Mercado La Terminal, Ciudad de Guatemala) and returns a JSON payload with the price per quintal, the update date, and the market name. Falls back to Q 235.00 if the portal is unreachable.
+  </Card>
+</CardGroup>
+
+### Runtime Requirements
+
+- **Node.js 18 or higher** (specified in `package.json`, version `2.0.0`, package `agro-jutiapa-analizador`).
+- No additional environment variables are required. All configuration (geographic bounds, soil parameters, climatological constants) is embedded in the function source.
+
+## Production Considerations
+
+### Cache Persistence
+
+| Deployment | `.cache/` directory | Behavior |
+|---|---|---|
+| Local Python server | Persists on disk between requests | ERA5 and NOAA data downloaded once, reused on subsequent calls until `--force-refresh` or manual deletion |
+| Vercel serverless | Ephemeral (reset on each cold start) | ERA5 data is fetched fresh from Open-Meteo on every invocation; no persistent cache across function instances |
+
+For high-throughput scenarios — such as multiple farmers querying simultaneously during the Primera planting window — the local Python server is strongly preferred. The persistent `.cache/` directory avoids redundant Open-Meteo and NOAA PSL downloads, and the in-memory `PIPELINE_INSTANCE` eliminates model reconstruction latency.
+
+### PDF Generation
+
+ReportLab PDF generation (`reporting/pdf_exporter.py`) is available **only in the Python server**. The Vercel Node.js functions do not include a PDF renderer. When the web app is served via Vercel, the PDF download button is disabled and the dictum is available as an on-screen HTML view only.
+
+<Warning>
+  The Vercel deployment does **not** include the full Python ML pipeline. `api/analyze.js` uses a JavaScript implementation of the geometry calculations and a pre-embedded logistic regression coefficient set for rapid inference — it does not run XGBoost, GroupKFold cross-validation, sigmoid calibration via `CalibratedClassifierCV`, or the full Saxton & Rawls soil physics module. For scientifically validated ML inference, full FAO-56 soil water balance simulation, ReportLab PDF generation, and persistent ERA5 caching, always use the **local Python server** (`python server.py 8000`).
+</Warning>

@@ -1,0 +1,188 @@
+---
+title: "XGBoost and Logistic Regression Models with Temporal Cross-Validation"
+sidebarTitle: "ML Models"
+description: "Four model configurations (XGBoost and Logistic Regression, with and without ENSO features) are validated with GroupKFold CV and compared on AUC and Brier Skill Score."
+---
+
+AGRO-JUTIAPA frames white maize sowing viability as a **binary classification problem**: given the agrometeorological conditions on a candidate sowing date, will the subsequent 60-day FAO-56 water balance yield a viable outcome (ETa/ETc ≥ 0.90, waterlogging ≤ 8 days)? Four model configurations are trained and compared on every pipeline run, using temporal cross-validation to evaluate how well each model generalizes to years it has never seen — the only meaningful test for a climate-driven prediction system. The best-performing configuration by Brier Skill Score is selected, calibrated, and used for all subsequent inference.
+
+## Model Configurations
+
+The pipeline benchmarks all four combinations of algorithm and feature set in a single pass:
+
+| Configuration Name | Algorithm | Feature Set | ENSO Included |
+|---|---|---|---|
+| `Logística local` | Logistic Regression | `features_local` (7 features) | ❌ |
+| `Logística local+ENSO` | Logistic Regression | `features_full` (9 features) | ✅ |
+| `XGBoost local` | XGBoost | `features_local` (7 features) | ❌ |
+| `XGBoost local+ENSO` | XGBoost | `features_full` (9 features) | ✅ |
+
+**Local features** (`features_local`) are derived entirely from ERA5: `precip_acc_15d`, `precip_acc_30d`, `balance_hidrico_30d`, `humedad_suelo_frac`, `dry_spell_len`, `doy_sin`, `doy_cos`.
+
+**Full features** (`features_full`) append the two ENSO lag predictors — `mei_lag1` and `mei_trend` — to the local set, providing the model with a macro-climate signal from the Pacific that can shift the baseline probability of drought or excess rain in Jutiapa.
+
+```python
+# From config/settings.py — MacroClimateConfig feature tuples
+features_local: Tuple[str, ...] = (
+    "precip_acc_15d",
+    "precip_acc_30d",
+    "balance_hidrico_30d",
+    "humedad_suelo_frac",
+    "dry_spell_len",
+    "doy_sin",
+    "doy_cos",
+)
+features_enso: Tuple[str, ...] = ("mei_lag1", "mei_trend")
+
+@property
+def features_full(self) -> List[str]:
+    return list(self.features_local + self.features_enso)
+```
+
+## XGBoost Architecture
+
+The XGBoost classifier is built with a deliberately shallow, heavily regularized architecture to prevent overfitting on the relatively short 45-year ERA5 record (≈ 16,000 sowing-season rows after filtering for valid months and non-NaN targets):
+
+```python
+# From core/models.py — make_xgb()
+xgb.XGBClassifier(
+    n_estimators=150,        # Total boosting rounds
+    max_depth=2,             # Shallow trees — forces ensemble diversity
+    learning_rate=0.05,      # Slow shrinkage — avoids aggressive fitting
+    subsample=0.8,           # Row subsampling per tree
+    colsample_bytree=0.8,    # Feature subsampling per tree
+    min_child_weight=20,     # Minimum leaf sample count — prevents rare-year overfitting
+    reg_lambda=5.0,          # L2 regularization on leaf weights
+    reg_alpha=0.5,           # L1 regularization — sparse feature selection
+    tree_method="hist",      # Histogram-based split finding (XGBoost 3.4 recommended)
+    eval_metric="logloss",
+    random_state=42,
+)
+```
+
+<Accordion title="Why these hyperparameters?">
+  - **`max_depth=2`**: Limits each tree to three-way interactions at most. Climate prediction with fewer than 10 features rarely benefits from deeper trees, which instead tend to memorize individual dry years.
+  - **`min_child_weight=20`**: Requires at least 20 training samples in every leaf node. With roughly 450 training samples per year split across 5 folds, this prevents the model from learning rules that apply only to one or two historically anomalous seasons.
+  - **`reg_lambda=5.0` (L2)** and **`reg_alpha=0.5` (L1)**: The combination of both regularization terms forces the model to use large weights only for features that are consistently predictive across all years — discarding spurious correlations with individual ENSO events.
+  - **`tree_method="hist"`**: The histogram algorithm bins continuous feature values before split finding, which is both faster and numerically more stable than the exact greedy algorithm for continuous climate data.
+</Accordion>
+
+**Class imbalance correction:** `scale_pos_weight` is computed automatically in `train_calibrated_model()` as the ratio of negative to positive samples in the training fold:
+
+```python
+# From core/models.py — dynamic scale_pos_weight
+neg_count = np.sum(y == 0)
+pos_count = np.sum(y == 1)
+spw = float(neg_count / max(pos_count, 1))
+```
+
+In years when the Dry Corridor experiences consecutive drought seasons, negative samples (failed sowing dates) can outnumber positive samples significantly, and `scale_pos_weight > 1` upweights the minority class during training to prevent the model from collapsing to a trivial "always viable" classifier.
+
+## Logistic Regression
+
+The logistic regression configuration uses a `scikit-learn` `Pipeline` that standardizes all features before fitting, ensuring that the L2 penalty (`C=0.5`) is applied uniformly regardless of the differing scales of precipitation accumulations (mm), soil fractions (0–1), and cyclical day-of-year features (−1 to 1):
+
+```python
+# From core/models.py — make_logit()
+make_pipeline(
+    StandardScaler(),
+    LogisticRegression(C=0.5, max_iter=1000, random_state=42)
+)
+```
+
+`C=0.5` (inverse of regularization strength) applies moderate L2 shrinkage. This conservative setting is appropriate for a 9-feature model trained on ≈ 45 distinct years of data, where the effective degrees of freedom are limited and overfitting is a genuine risk even for linear models.
+
+## Temporal Cross-Validation
+
+Standard k-fold cross-validation is inappropriate for climate time series because adjacent years share correlated antecedent conditions — a fold boundary between 2009 and 2010 would still allow training on 2011 data to inform predictions for 2009. AGRO-JUTIAPA uses **GroupKFold with `n_splits=5` and `groups=year`** to enforce strict temporal isolation:
+
+```python
+# From core/models.py — cross_validate()
+from sklearn.model_selection import GroupKFold
+
+gkf = GroupKFold(n_splits=5)
+for tr, te in gkf.split(X, y, groups):
+    m = make_model_fn().fit(X[tr], y[tr])
+    oof[te] = m.predict_proba(X[te])[:, 1]
+    clim[te] = y[tr].mean()          # Climatology baseline: in-fold positive rate
+```
+
+Each fold holds out approximately **9 complete calendar years** as the test set. The model trained on the remaining ≈ 36 years is then evaluated on those 9 held-out years, and predictions are accumulated into an **out-of-fold (OOF) array** that covers the full dataset exactly once. This mirrors the real-world inference scenario where the model must generalize to future years it has never observed.
+
+<Note>
+  Year-based grouping is critical because the FAO-56 water balance features (`humedad_suelo_frac`, `balance_hidrico_30d`) carry autocorrelation across adjacent days. If the same year appeared in both the training and test partitions, the model would effectively "see" the soil moisture state it is trying to predict — an optimistic data leak that inflates AUC and BSS estimates by several percentage points.
+</Note>
+
+## Evaluation Metrics
+
+Two complementary metrics are computed from the OOF predictions:
+
+<CardGroup cols={2}>
+  <Card title="ROC-AUC" icon="chart-area">
+    **Area Under the Receiver Operating Characteristic Curve**
+
+    Measures the model's ability to rank viable sowing dates above failed ones, regardless of the probability threshold. AUC = 0.5 is a random classifier; AUC = 1.0 is perfect discrimination.
+
+    ```python
+    auc = roc_auc_score(y, oof)
+    ```
+
+    AUC is reported for all four configurations but is **not** used as the model selection criterion, because it measures discrimination only — not the calibration quality of the probability outputs.
+  </Card>
+  <Card title="Brier Skill Score (BSS)" icon="bullseye">
+    **BSS = 1 − BS_model / BS_climatology**
+
+    Measures whether the model's probability forecasts are more accurate than the naive local climatology baseline (the historical fraction of viable sowing dates in the training fold).
+
+    ```python
+    bs_model = brier_score_loss(y, oof)
+    bs_clim  = brier_score_loss(y, clim)  # clim = in-fold positive rate
+    bss = 1.0 - (bs_model / max(bs_clim, 1e-6))
+    ```
+
+    **BSS > 0**: model beats climatology baseline. **BSS = 0**: model is no better than saying "the probability equals the historical average". **BSS < 0**: model is worse than climatology. The configuration with the **highest BSS** is selected as the final model.
+  </Card>
+</CardGroup>
+
+## Calibration
+
+Even after temporal cross-validation, the raw probability outputs of both XGBoost and logistic regression can be poorly calibrated — particularly XGBoost, which tends to push predicted probabilities toward 0 and 1. AGRO-JUTIAPA applies **sigmoid (Platt scaling) calibration** using `CalibratedClassifierCV`:
+
+```python
+# From core/models.py — train_calibrated_model()
+from sklearn.calibration import CalibratedClassifierCV
+
+splits = list(GroupKFold(n_splits=5).split(X, y, groups))
+calibrated = CalibratedClassifierCV(
+    estimator=model_fn(),
+    method="sigmoid",   # Platt scaling — fits a logistic sigmoid on OOF predictions
+    cv=splits           # Reuses the same year-grouped folds for calibration
+)
+calibrated.fit(X, y)
+```
+
+Passing the pre-computed `GroupKFold` splits to `CalibratedClassifierCV` ensures that the calibration is performed with the **same temporal isolation** as the cross-validation step — preventing the sigmoid fit from absorbing information about held-out years. After calibration, `predict_proba()` returns well-formed probabilities that can be compared against the traffic light thresholds without requiring an additional reliability correction.
+
+## Model Selection
+
+The complete model selection flow in `pipeline.py` is:
+
+```python
+# From pipeline.py — model comparison and selection
+configs = {
+    "Logística local":      (list(macro_cfg.features_local), make_logit),
+    "Logística local+ENSO": (macro_cfg.features_full,        make_logit),
+    "XGBoost local":        (list(macro_cfg.features_local), make_xgb),
+    "XGBoost local+ENSO":   (macro_cfg.features_full,        make_xgb),
+}
+cv_res = {}
+for name, (feats, mk_fn) in configs.items():
+    cv_res[name] = cross_validate(train_df, feats, mk_fn)
+    print(f"  {name:<22} AUC={cv_res[name]['auc']:.3f} | BSS={cv_res[name]['bss']:+.3f}")
+
+best_model_name = max(cv_res, key=lambda k: cv_res[k]["bss"])
+feats_best, mk_best = configs[best_model_name]
+calibrated_model = train_calibrated_model(train_df, feats_best, mk_best)
+```
+
+The trained and calibrated model, the full dataset, and the best feature list are stored in the **in-memory pipeline cache** (`AgroViabilityPipeline._cache_store`) keyed by `(lat, lon)`. On subsequent requests for the same location the pipeline skips re-training entirely, reducing inference latency to milliseconds.

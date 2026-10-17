@@ -1,0 +1,290 @@
+---
+title: "Soil Water Balance: SoilProfile, bucket_series, and build_dataset"
+sidebarTitle: "Soil Balance"
+description: "core/soil_balance.py implements Saxton & Rawls pedotransfer equations, the FAO-56 bucket simulation, and the full feature dataset builder for ML training."
+---
+
+`core/soil_balance.py` is the hydrological engine of AGRO-JUTIAPA. It translates field-measurable soil texture data (sand, clay, organic matter percentages) into volumetric water-holding capacity constants via the Saxton & Rawls (2006) pedotransfer functions, then runs a continuous FAO-56 bucket simulation to track daily soil moisture over the entire ERA5 record. The resulting daily features — rolling rainfall accumulations, dry-spell lengths, antecedent soil moisture fractions, and a binary viability target — form the training dataset consumed by the machine-learning models in `core/models.py`.
+
+---
+
+## `SoilProfile` Class
+
+`SoilProfile` encapsulates all pedological state for the modeled soil column. It is instantiated once per pipeline run and reused across both the pre-sowing antecedent moisture simulation and the 60-day crop-window simulation.
+
+```python
+class SoilProfile:
+    def __init__(self, cfg: SoilConfig = SOIL_CONFIG): ...
+```
+
+<ParamField path="cfg" type="SoilConfig" default="SOIL_CONFIG">
+  Configuration object carrying `sand_pct` (%), `clay_pct` (%), `om_pct` (organic matter, %), and `p_depletion` (fraction of TAW considered readily available without water stress, typically 0.5 for maize).
+</ParamField>
+
+### Computed Attributes
+
+After `__init__` runs the pedotransfer equations, two volumetric water-content constants are stored:
+
+<ResponseField name="theta_fc" type="float">
+  Volumetric water content at field capacity (cm³/cm³), computed with the two-step Saxton & Rawls correction for non-linearity at high clay fractions.
+</ResponseField>
+
+<ResponseField name="theta_wp" type="float">
+  Volumetric water content at permanent wilting point (cm³/cm³), computed with the Saxton & Rawls correction for the wilting-point non-linearity.
+</ResponseField>
+
+### Saxton & Rawls Equations (as implemented)
+
+```python
+# --- Field Capacity (θFC) ---
+s = cfg.sand_pct / 100.0
+c = cfg.clay_pct / 100.0
+om = cfg.om_pct
+
+fc_first = (
+    -0.251 * s + 0.195 * c + 0.011 * om + 0.006 * s * om
+    - 0.027 * c * om + 0.452 * s * c + 0.299
+)
+theta_fc = fc_first + (1.283 * fc_first**2 - 0.374 * fc_first - 0.015)
+
+# --- Wilting Point (θWP) ---
+wp_first = (
+    -0.024 * s + 0.487 * c + 0.006 * om + 0.005 * s * om
+    - 0.013 * c * om + 0.068 * s * c + 0.031
+)
+theta_wp = wp_first + (0.14 * wp_first - 0.02)
+```
+
+<Note>
+  The two-step correction (`fc_first → theta_fc` and `wp_first → theta_wp`) is the normalisation proposed by Saxton & Rawls (2006) to improve accuracy in soils with high organic matter or heavy clay fractions, typical of the Jutiapa volcanic-derived andisols.
+</Note>
+
+### `taw()` Method
+
+```python
+def taw(self, root_depth_mm: float) -> float
+```
+
+Returns the Total Available Water (TAW, mm) — the maximum water the soil can hold against gravity between field capacity and wilting point — for a given root zone depth.
+
+**Formula:** `TAW = (θ_FC − θ_WP) × root_depth_mm`
+
+<ParamField path="root_depth_mm" type="float">
+  Effective rooting depth in millimetres. The pipeline uses `agro_cfg.fallow_root_mm` for pre-sowing antecedent moisture and `agro_cfg.crop_root_mm` for the 60-day crop simulation.
+</ParamField>
+
+### `raw()` Method
+
+```python
+def raw(self, root_depth_mm: float) -> float
+```
+
+Returns the Readily Available Water (RAW, mm) — the fraction of TAW that can be extracted without triggering water stress (Kₛ < 1). 
+
+**Formula:** `RAW = p_depletion × TAW(root_depth_mm)`
+
+---
+
+## `bucket_series()` Function
+
+```python
+def bucket_series(
+    p_arr: np.ndarray,
+    et0_arr: np.ndarray,
+    taw: float,
+    raw: float,
+    kc: float,
+    s0_frac: float = 0.5,
+) -> np.ndarray
+```
+
+Runs the continuous single-layer bucket simulation across the full ERA5 record to estimate antecedent soil moisture before any sowing date. The simulation represents the fallow/inter-crop period between sowing seasons using a constant crop coefficient `kc`.
+
+<ParamField path="p_arr" type="np.ndarray">
+  Daily precipitation array (mm), shape `(N,)`.
+</ParamField>
+
+<ParamField path="et0_arr" type="np.ndarray">
+  Daily FAO-56 reference evapotranspiration array (mm), shape `(N,)`.
+</ParamField>
+
+<ParamField path="taw" type="float">
+  Total Available Water for the fallow root depth (mm). Computed as `soil.taw(agro_cfg.fallow_root_mm)`.
+</ParamField>
+
+<ParamField path="raw" type="float">
+  Readily Available Water for the fallow root depth (mm). Computed as `soil.raw(agro_cfg.fallow_root_mm)`.
+</ParamField>
+
+<ParamField path="kc" type="float">
+  Fallow crop coefficient (`agro_cfg.fallow_kc`). Scales ET₀ to represent bare or residue-covered soil evaporation.
+</ParamField>
+
+<ParamField path="s0_frac" type="float" default="0.5">
+  Initial soil moisture fraction of TAW. Defaults to 50 % of field capacity.
+</ParamField>
+
+**Returns:** `np.ndarray` of shape `(N,)` — the daily soil moisture fraction `s / TAW` in `[0, 1]`.
+
+### Water Stress Factor Kₛ Logic
+
+At each time step `i`, the FAO-56 water stress coefficient is evaluated:
+
+```python
+# Ks = 1 when soil depletion is within the RAW threshold (no stress)
+# Ks linearly decreases toward 0 as soil moisture approaches zero
+ks = 1.0 if (taw - s) <= raw else min(1.0, max(0.0, s / max(taw - raw, 1e-6)))
+s = min(taw, max(0.0, s + p_arr[i] - kc * et0_arr[i] * ks))
+```
+
+The bucket is bounded: it cannot exceed `taw` (surface runoff) or fall below zero (hard floor). The fraction `s / taw` is stored as the output at each step.
+
+---
+
+## `simulate_window()` Function
+
+```python
+def simulate_window(
+    p_window: np.ndarray,
+    et0_window: np.ndarray,
+    f0: float,
+    soil: SoilProfile,
+    agro_cfg: AgroConfig = AGRO_CONFIG,
+) -> Tuple[float, int]
+```
+
+Simulates the FAO-56 water balance for the 60-day critical crop window starting the day after sowing. This is the innermost simulation called for every historical sowing-month date during dataset construction.
+
+<ParamField path="p_window" type="np.ndarray">
+  Daily precipitation for the 60-day window, shape `(60,)`, in mm.
+</ParamField>
+
+<ParamField path="et0_window" type="np.ndarray">
+  Daily reference ET₀ for the 60-day window, shape `(60,)`, in mm.
+</ParamField>
+
+<ParamField path="f0" type="float">
+  Initial soil moisture fraction (from `bucket_series` at sowing time `t`). Used to set the starting soil storage `s = f0 × TAW`.
+</ParamField>
+
+<ParamField path="soil" type="SoilProfile">
+  Instantiated `SoilProfile` object providing `theta_fc`, `theta_wp`, and `p_depletion`.
+</ParamField>
+
+<ParamField path="agro_cfg" type="AgroConfig" default="AGRO_CONFIG">
+  Provides `window_days` (60), `crop_root_mm`, `kc_curve` (day-by-day Kc array of length 60), `excess_mm_day` (waterlogging threshold), and `waterlog_max_days`.
+</ParamField>
+
+**Returns:** `Tuple[float, int]`
+
+<ResponseField name="ratio (ETa/ETc)" type="float">
+  The ratio of actual evapotranspiration to potential crop evapotranspiration over the 60-day window. Values below `agro_cfg.eta_etc_min` indicate drought failure; values at or above 1.0 indicate full demand coverage.
+</ResponseField>
+
+<ResponseField name="waterlog_days" type="int">
+  Number of days in the window where the daily surplus exceeded `agro_cfg.excess_mm_day` mm above field capacity. Compared against `agro_cfg.waterlog_max_days` to flag waterlogging failure.
+</ResponseField>
+
+---
+
+## `build_dataset()` Function
+
+```python
+def build_dataset(
+    df_weather: pd.DataFrame,
+    df_macro: pd.DataFrame,
+    soil: SoilProfile,
+    agro_cfg: AgroConfig = AGRO_CONFIG,
+) -> pd.DataFrame
+```
+
+Assembles the complete feature matrix and binary viability labels used for ML training. This is the most computationally intensive step: it calls `bucket_series` once over the full ERA5 record and then calls `simulate_window` for every valid sowing-month date.
+
+<ParamField path="df_weather" type="pd.DataFrame">
+  Daily ERA5 DataFrame from `fetch_weather()`. Must contain columns: `time`, `precip_mm`, `et0_mm`.
+</ParamField>
+
+<ParamField path="df_macro" type="pd.DataFrame">
+  Monthly ENSO DataFrame from `fetch_macro()`. Index is a `DatetimeIndex` at month-start frequency. Columns: `mei_lag1`, `mei_trend`, `nino34_lag1`.
+</ParamField>
+
+<ParamField path="soil" type="SoilProfile">
+  Pre-computed soil profile for the study site.
+</ParamField>
+
+<ParamField path="agro_cfg" type="AgroConfig" default="AGRO_CONFIG">
+  Agronomic configuration controlling the spinup period, sowing months, window length, and failure thresholds.
+</ParamField>
+
+**Returns:** `pd.DataFrame` with one row per calendar day and the following engineered columns:
+
+<Expandable title="Feature columns">
+  <ResponseField name="humedad_suelo_frac" type="float">
+    Antecedent soil moisture fraction (0–1) from the fallow bucket simulation.
+  </ResponseField>
+  <ResponseField name="dry_spell_len" type="int">
+    Cumulative consecutive dry days (< 1.5 mm/day) ending at each date.
+  </ResponseField>
+  <ResponseField name="precip_acc_15d" type="float">
+    Rolling 15-day precipitation accumulation (mm, NaN for the first 14 days).
+  </ResponseField>
+  <ResponseField name="precip_acc_30d" type="float">
+    Rolling 30-day precipitation accumulation (mm, NaN for the first 29 days).
+  </ResponseField>
+  <ResponseField name="balance_hidrico_30d" type="float">
+    Rolling 30-day water balance: `precip_acc_30d − ET₀_acc_30d` (mm).
+  </ResponseField>
+  <ResponseField name="doy_sin / doy_cos" type="float">
+    Sine and cosine encoding of day-of-year for continuous seasonality representation: `sin(2π × doy / 365.25)` and `cos(2π × doy / 365.25)`.
+  </ResponseField>
+  <ResponseField name="mei_lag1 / mei_trend / nino34_lag1" type="float">
+    Monthly ENSO indices merged by calendar month. `mei_lag1` is the MEI v2 value one month prior; `mei_trend` is the first difference of `mei_lag1`.
+  </ResponseField>
+  <ResponseField name="eta_etc" type="float">
+    ETa/ETc ratio from `simulate_window()` for sowing-month dates; `NaN` otherwise.
+  </ResponseField>
+  <ResponseField name="dias_anegamiento" type="float">
+    Waterlogging day count from `simulate_window()` for sowing-month dates; `NaN` otherwise.
+  </ResponseField>
+  <ResponseField name="fallo_sequia" type="bool">
+    `True` when `eta_etc < agro_cfg.eta_etc_min`.
+  </ResponseField>
+  <ResponseField name="fallo_exceso" type="bool">
+    `True` when `dias_anegamiento > agro_cfg.waterlog_max_days`.
+  </ResponseField>
+  <ResponseField name="target" type="float">
+    Binary viability label: `1.0` = viable (no drought or waterlogging failure), `0.0` = failure, `NaN` for non-sowing-month rows.
+  </ResponseField>
+</Expandable>
+
+---
+
+## Usage Example
+
+```python
+from core.soil_balance import SoilProfile, build_dataset
+from config.settings import SOIL_CONFIG, AGRO_CONFIG
+
+soil = SoilProfile(SOIL_CONFIG)
+print(f"θFC = {soil.theta_fc:.3f}  θWP = {soil.theta_wp:.3f}")
+print(f"TAW (600mm root) = {soil.taw(600):.1f} mm")
+print(f"RAW (600mm root) = {soil.raw(600):.1f} mm")
+```
+
+To build the full ML training dataset after fetching weather and macro data:
+
+```python
+from core.data_fetcher import fetch_weather, fetch_macro
+from config.settings import GEO_CONFIG, MACRO_CONFIG, PATH_CONFIG
+
+df_weather = fetch_weather(geo=GEO_CONFIG, cache_dir=PATH_CONFIG.cache_dir)
+df_macro = fetch_macro(macro_cfg=MACRO_CONFIG, cache_dir=PATH_CONFIG.cache_dir)
+
+ds = build_dataset(df_weather, df_macro, soil, AGRO_CONFIG)
+train_df = ds.dropna(subset=MACRO_CONFIG.features_full + ["target"])
+
+print(f"Training samples: {len(train_df)}")
+print(f"Historical success rate: {train_df['target'].mean():.1%}")
+print(f"Drought failures: {train_df['fallo_sequia'].mean():.1%}")
+print(f"Waterlogging failures: {train_df['fallo_exceso'].mean():.1%}")
+```

@@ -1,0 +1,86 @@
+---
+title: "AGRO-JUTIAPA REST API Overview"
+sidebarTitle: "Overview"
+description: "Overview of the two AGRO-JUTIAPA REST endpoints: POST /api/analyze for full ML inference and GET /api/maga-price for real-time MAGA wholesale corn price scraping."
+---
+
+AGRO-JUTIAPA exposes a lightweight REST API that powers the open-access agrometeorological and financial viability platform for white maize sowing in Calderas, San José Acatempa, Jutiapa, Guatemala. The API requires no authentication and is available both on the local multithreaded Python server (port 8000) and as Vercel Serverless Functions on your production deployment.
+
+## Base URLs
+
+| Environment | Base URL |
+|-------------|----------|
+| Local (Python server) | `http://localhost:8000` |
+| Vercel deployment | `https://your-project.vercel.app` |
+
+Start the local server with:
+
+```bash
+python server.py 8000
+```
+
+## Authentication
+
+No authentication is required. All endpoints are open access — consistent with the platform's design principle of universal, unrestricted access for smallholder producers in the Guatemalan Dry Corridor.
+
+## CORS
+
+Every endpoint sets the following response header, allowing cross-origin requests from any browser or client:
+
+```
+Access-Control-Allow-Origin: *
+```
+
+All endpoints also handle `OPTIONS` preflight requests, responding with `200 OK` and the full set of allowed methods and headers before any actual data transfer occurs.
+
+## Rate Limits
+
+No rate limits are enforced at the application level. However, the server does impose a **10 KB maximum request body size** on `POST /api/analyze` to prevent denial-of-service. Requests exceeding this limit receive an HTTP `413` response.
+
+## Endpoints Summary
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/analyze` | Full agrometeorological + financial analysis: ERA5 ingestion, FAO-56 water balance, XGBoost inference, traffic-light verdict, parcel geometry, sowing density, and P&L projection |
+| `GET` | `/api/maga-price` | Real-time wholesale corn price scraped from the official MAGA Guatemala portal (La Terminal market), with 10-minute in-memory cache and Q 235.00 fallback |
+
+<CardGroup cols={2}>
+  <Card title="POST /api/analyze" icon="seedling" href="/api/analyze">
+    Full ERA5 + FAO-56 + XGBoost pipeline. Returns a calibrated sowing probability, traffic-light verdict, 60-day water balance timeline, phenological streak analysis, and P&L projection.
+  </Card>
+  <Card title="GET /api/maga-price" icon="tag" href="/api/maga-price">
+    Real-time MAGA Guatemala wholesale corn price for Maíz blanco, de primera at La Terminal market. Cached for 10 minutes with automatic Q 235.00 fallback.
+  </Card>
+</CardGroup>
+
+## Error Format
+
+All error responses from both endpoints share the same JSON envelope:
+
+```json
+{
+  "success": false,
+  "error": "Human-readable description of the error."
+}
+```
+
+`POST /api/analyze` also sets an optional `validation_error` flag on `400` responses to distinguish input validation failures from internal errors:
+
+```json
+{
+  "success": false,
+  "error": "UBICACIÓN NO PERMITIDA: Este sistema está diseñado, calibrado y habilitado ÚNICAMENTE para Calderas...",
+  "validation_error": true
+}
+```
+
+### HTTP Status Codes
+
+| Code | Meaning |
+|------|---------|
+| `200` | Success — response body contains the requested data |
+| `400` | Validation error — invalid input parameter (includes `validation_error: true`) |
+| `404` | Not found — unrecognized path |
+| `405` | Method not allowed — wrong HTTP method for the endpoint |
+| `413` | Request body too large — exceeds the 10 KB limit on `POST /api/analyze` |
+| `500` | Internal server error — pipeline execution or scraping failure |

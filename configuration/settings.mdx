@@ -1,0 +1,181 @@
+---
+title: "Configuration Reference: Dataclasses and Global Settings"
+sidebarTitle: "Settings"
+description: "Complete reference for all configuration dataclasses in config/settings.py: GeoConfig, AgroConfig, SoilConfig, MacroClimateConfig, MagaPriceConfig, SemaforoConfig, and PathConfig."
+---
+
+`config/settings.py` is the single source of truth for every tunable parameter in the AGRO-JUTIAPA platform. All parameters are grouped into purpose-specific **frozen dataclasses** — once instantiated, their fields are immutable. Each dataclass has a corresponding **global singleton** (`GEO_CONFIG`, `AGRO_CONFIG`, `SOIL_CONFIG`, `MACRO_CONFIG`, `MAGA_CONFIG`, `SEMAFORO_CONFIG`, `VALIDATION_CONFIG`, `PATH_CONFIG`) that the pipeline uses by default. You can override any subset of parameters by constructing a new dataclass instance and passing it to the pipeline — the rest of this page covers every field and its default value.
+
+---
+
+## GeoConfig
+
+Controls the geographic anchor point used when fetching historical climate data from the Open-Meteo archive API, including the site's coordinates, temporal baseline, timezone, and the list of daily meteorological variables to retrieve.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `lat` | `float` | `14.267` | Latitude of the study site (Calderas, San José Acatempa). |
+| `lon` | `float` | `-90.133` | Longitude of the study site. |
+| `start_year` | `int` | `1981` | First year of the ERA5 historical archive to retrieve. |
+| `timezone` | `str` | `"America/Guatemala"` | IANA timezone identifier for date alignment. |
+| `municipality` | `str` | `"Calderas, San José Acatempa, Jutiapa (Guatemala)"` | Human-readable label used in reports and audit trails. |
+| `archive_url` | `str` | `"https://archive-api.open-meteo.com/v1/archive"` | Base URL of the Open-Meteo historical archive endpoint. |
+| `daily_vars` | `Tuple[str, ...]` | `("precipitation_sum", "et0_fao_evapotranspiration", "temperature_2m_mean")` | Ordered tuple of Open-Meteo daily variable keys to request. |
+
+**Global instance:** `GEO_CONFIG`
+
+---
+
+## AgroConfig
+
+Contains every agronomic and phenological parameter that governs white maize crop modelling: the sowing window, water-stress thresholds, waterlogging limits, and crop coefficient (Kc) control points.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `sowing_months` | `List[int]` | `[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]` | Calendar months in which sowing analysis is enabled (all 12). |
+| `window_days` | `int` | `60` | Duration (days) of the post-sowing critical window evaluated for crop stress. |
+| `total_cycle_days` | `int` | `120` | Full crop cycle length in days from sowing to harvest. |
+| `spinup_days` | `int` | `365` | Soil water model warm-up period (days) run before the analysis window. |
+| `eta_etc_min` | `float` | `0.90` | Minimum acceptable ETa/ETc ratio; values below this threshold trigger a water-stress flag. |
+| `excess_mm_day` | `float` | `15.0` | Daily rainfall excess (mm) above which waterlogging risk is counted. |
+| `waterlog_max_days` | `int` | `8` | Maximum number of consecutive waterlogged days tolerated before flagging failure. |
+| `kc_days_points` | `Tuple[int, int, int]` | `(0, 20, 60)` | Day-of-cycle control points for the piecewise Kc interpolation. |
+| `kc_values_points` | `Tuple[float, float, float]` | `(0.30, 0.30, 1.15)` | Kc values corresponding to `kc_days_points` (initial → mid-season). |
+| `fallow_kc` | `float` | `0.5` | Crop coefficient applied during fallow / off-season periods. |
+| `fallow_root_mm` | `float` | `400.0` | Effective root zone depth (mm) used during fallow for soil water balance. |
+| `crop_root_mm` | `float` | `600.0` | Effective root zone depth (mm) used during the active crop cycle. |
+
+**`kc_curve` property** — Returns a `numpy.ndarray` of length `window_days` (60 values) built by linearly interpolating between `kc_days_points` and `kc_values_points`. This vector is used day-by-day to scale reference evapotranspiration (ET₀) into crop evapotranspiration (ETc).
+
+**Global instance:** `AGRO_CONFIG`
+
+---
+
+## SoilConfig
+
+Defines soil texture and water-retention properties following the **Saxton & Rawls (2006)** pedotransfer functions. These values set the field capacity, wilting point, and plant-available water capacity used in the daily soil water balance.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `clay_pct` | `float` | `26.0` | Clay content (%) — default corresponds to sandy clay loam (Franco-arcillo-arenoso). |
+| `sand_pct` | `float` | `52.0` | Sand content (%). |
+| `om_pct` | `float` | `1.8` | Organic matter content (%). |
+| `p_depletion` | `float` | `0.55` | FAO-56 depletion fraction *p* for the readily available water (RAW) calculation. |
+
+**Global instance:** `SOIL_CONFIG`
+
+---
+
+## MacroClimateConfig
+
+Stores the official NOAA PSL URLs for ENSO macro-climate indices and defines the feature sets consumed by the random-forest sowing-probability model (RF-03). Separating local hydrometeorological features from ENSO teleconnection features allows the model to run in a reduced local-only mode when remote data are unavailable.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `urls["mei_v2"]` | `str` | `"https://psl.noaa.gov/data/correlation/meiv2.data"` | NOAA PSL endpoint for the Multivariate ENSO Index v2 (MEI v2). |
+| `urls["nino34_anom"]` | `str` | `"https://psl.noaa.gov/data/timeseries/month/data/nino34.long.anom.data"` | NOAA PSL endpoint for the Niño 3.4 sea-surface temperature anomaly. |
+| `features_local` | `Tuple[str, ...]` | `("precip_acc_15d", "precip_acc_30d", "balance_hidrico_30d", "humedad_suelo_frac", "dry_spell_len", "doy_sin", "doy_cos")` | Seven local hydrometeorological predictors derived from ERA5 reanalysis. |
+| `features_enso` | `Tuple[str, ...]` | `("mei_lag1", "mei_trend")` | Two ENSO-based teleconnection predictors (one-month-lagged MEI and its short-term trend). |
+
+**`features_full` property** — Returns a single `List[str]` that concatenates `features_local` and `features_enso`, giving the complete 9-feature vector used when remote ENSO data are available.
+
+**Global instance:** `MACRO_CONFIG`
+
+---
+
+## MagaPriceConfig
+
+Official market prices and average per-manzana production costs sourced from the **Ministerio de Agricultura, Ganadería y Alimentación (MAGA) — DIPLAN / SIMPA** at Mercado Mayorista La Terminal. These values drive all financial viability calculations in the pipeline.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `fuente_oficial` | `str` | `"MAGA - DIPLAN / SIMPA (Mercado Mayorista La Terminal)"` | Citation label for the official price source. |
+| `fecha_actualizacion` | `str` | `"2026-10-09"` | ISO date of the last MAGA price update loaded into the system. |
+| `precio_qq_maiz_blanco` | `float` | `235.0` | Reference market price of white maize per quintal (Q/qq). |
+| `costo_preparacion_suelo_mz` | `float` | `650.0` | Average soil preparation cost per manzana (Q/mz). |
+| `costo_semilla_mz` | `float` | `850.0` | Average seed cost per manzana (Q/mz). |
+| `costo_fertilizacion_mz` | `float` | `1,800.0` | Average fertilisation cost per manzana (Q/mz). |
+| `costo_control_plagas_malezas_mz` | `float` | `600.0` | Average pest and weed control cost per manzana (Q/mz). |
+| `costo_mano_obra_labores_mz` | `float` | `1,200.0` | Average labour cost per manzana (Q/mz). |
+| `costo_cosecha_desgrane_mz` | `float` | `800.0` | Average harvest and shelling cost per manzana (Q/mz). |
+| `rendimiento_base_qq_mz` | `float` | `65.0` | Expected baseline yield in quintals per manzana for the Jutiapa region. |
+
+**Global instance:** `MAGA_CONFIG`
+
+---
+
+## SemaforoConfig
+
+Defines the two probability thresholds that convert a continuous sowing-success probability (output of RF-03) into the three-colour agrometeorological traffic-light recommendation shown to farmers.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `prob_optimo_min` | `float` | `0.80` | Lower bound for the **ÓPTIMO** (green) category. |
+| `prob_alerta_min` | `float` | `0.40` | Lower bound for the **CONDICIONADO / ALERTA** (yellow) category. |
+
+**Threshold logic:**
+
+- `prob ≥ 0.80` → 🟢 **ÓPTIMO** — Favourable conditions; historical success rate exceeds 76 %.
+- `0.40 ≤ prob < 0.80` → 🟡 **CONDICIONADO / ALERTA** — Proceed with caution; intermediate risk.
+- `prob < 0.40` → 🔴 **NO SEMBRAR** — Do not sow; historical failure rate exceeds 89 %.
+
+**Global instance:** `SEMAFORO_CONFIG`
+
+---
+
+## ValidationConfig
+
+All bounds enforced by the input validator before any pipeline computation begins. These limits are grounded in 45 years of ERA5 data, ICTA field studies, and MAGA-DIPLAN records for the Jutiapa Dry Corridor.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `lat_min` | `float` | `14.240` | Southern boundary of the Calderas micro-region (degrees N). |
+| `lat_max` | `float` | `14.290` | Northern boundary of the Calderas micro-region (degrees N). |
+| `lon_min` | `float` | `-90.160` | Western boundary of the Calderas micro-region (degrees W). |
+| `lon_max` | `float` | `-90.110` | Eastern boundary of the Calderas micro-region (degrees W). |
+| `localidad_exclusiva` | `str` | `"Calderas, San José Acatempa, Jutiapa"` | Human-readable name of the exclusive service area. |
+| `date_min_year` | `int` | `1981` | Earliest sowing year accepted (start of ERA5 archive). |
+| `date_max_year` | `int` | `2030` | Latest sowing year accepted (planning horizon). |
+| `capital_min_q` | `float` | `500.0` | Absolute minimum capital in Quetzales (Q); below this, seed cannot be purchased. |
+| `capital_max_q` | `float` | `150,000.0` | Maximum reasonable capital for family-scale agriculture (Q). |
+| `capital_per_mz_min_q` | `float` | `2,000.0` | Minimum historical capital per manzana for subsistence farming (Q/mz). |
+| `capital_per_mz_max_q` | `float` | `25,000.0` | Maximum historical capital per manzana for fully mechanised, irrigated maize (Q/mz). |
+| `side_min_m` | `float` | `1.0` | Minimum parcel side length (metres). |
+| `side_max_m` | `float` | `2,000.0` | Maximum parcel side length (metres). |
+| `max_area_m2` | `float` | `700,000.0` | Maximum parcel area (m²) — equivalent to 100 manzanas. |
+| `max_string_length` | `int` | `100` | Maximum character length for any string input (anti-DoS). |
+
+**Global instance:** `VALIDATION_CONFIG`
+
+---
+
+## PathConfig
+
+Resolves absolute filesystem paths relative to the project root at import time. The `cache_dir` and `output_dir` subdirectories are created automatically via `__post_init__` if they do not yet exist.
+
+| Field | Type | Resolved value | Description |
+|---|---|---|---|
+| `root_dir` | `Path` | `Path(__file__).resolve().parent.parent` | Absolute path to the project root directory. |
+| `cache_dir` | `Path` | `<root_dir>/.cache/` | Directory for HTTP response caches (Open-Meteo, NOAA PSL). Created automatically. |
+| `output_dir` | `Path` | `<root_dir>/output/` | Directory for generated PDF reports and CSV exports. Created automatically. |
+
+**Global instance:** `PATH_CONFIG`
+
+---
+
+## Overriding Defaults
+
+Every dataclass is frozen, so the global singletons cannot be mutated in place. To customise any parameter, construct a new instance of the relevant dataclass and pass it as a keyword argument to `AgroViabilityPipeline`. Fields you do not specify keep their defaults.
+
+```python
+from config.settings import SoilConfig, AgroConfig
+from pipeline import AgroViabilityPipeline
+
+custom_soil = SoilConfig(clay_pct=30.0, sand_pct=48.0, om_pct=2.1, p_depletion=0.55)
+custom_agro = AgroConfig(eta_etc_min=0.85, waterlog_max_days=10)
+pipeline = AgroViabilityPipeline(soil_cfg=custom_soil, agro_cfg=custom_agro)
+```
+
+<Warning>
+All configuration dataclasses are **frozen** (`frozen=True`). Attempting to set a field on an existing instance — for example `AGRO_CONFIG.eta_etc_min = 0.85` — raises a `FrozenInstanceError` at runtime. Always create a **new instance** with the desired values, as shown above.
+</Warning>

@@ -1,0 +1,189 @@
+---
+title: "FAO-56 Soil Water Balance and Pedotransfer Equations"
+sidebarTitle: "Soil Water Balance"
+description: "AGRO-JUTIAPA uses Saxton & Rawls (2006) pedotransfer equations and a FAO-56 bucket simulation to model daily soil moisture for Jutiapa's loamy soil profile."
+---
+
+Accurate daily soil moisture estimation is especially critical in the Guatemalan Dry Corridor, where white maize sown in Calderas, San José Acatempa must survive a highly variable monsoon onset, frequent mid-summer dry spells (canícula), and episodic waterlogging events — sometimes within the same growing season. AGRO-JUTIAPA resolves this challenge through a physically grounded two-layer model: the Saxton & Rawls (2006) pedotransfer equations translate locally observed soil texture into hydraulic limits, and a FAO-56 bucket simulation propagates those limits forward through 60 daily time steps to assess whether a candidate sowing date can meet the crop's water demand.
+
+## Soil Profile (Jutiapa Defaults)
+
+The default soil profile represents the dominant **Franco-arcillo-arenoso** (Sandy Clay Loam) texture found in the rain-fed milpa parcels of Calderas, Jutiapa, calibrated from field surveys and ICTA Guatemala records:
+
+| Parameter | Default Value | Description |
+|---|---|---|
+| `clay_pct` | **26.0 %** | Clay fraction — governs water retention and cohesion |
+| `sand_pct` | **52.0 %** | Sand fraction — controls drainage speed and aeration |
+| `om_pct` | **1.8 %** | Organic matter content — improves water-holding capacity |
+| `p_depletion` | **0.55** | FAO-56 depletion fraction for maize (fraction of TAW removable without stress) |
+
+This texture class sits at the boundary between loam and sandy clay loam, with relatively fast internal drainage and moderate water-holding capacity — typical of the volcanic piedmont soils in Jutiapa's eastern highlands. The organic matter value of 1.8% reflects the degraded condition common in smallholder plots with limited residue management.
+
+<Warning>
+  Changing any of the four `SoilConfig` parameters (`clay_pct`, `sand_pct`, `om_pct`, `p_depletion`) alters θ_FC, θ_WP, TAW, and RAW across the entire 45-year historical dataset. This invalidates the existing ML model weights because the training labels (viable / not viable) were generated under the original hydraulic limits. Always retrain and recalibrate all four model configurations after modifying soil parameters.
+</Warning>
+
+## Saxton & Rawls Pedotransfer Equations
+
+The `SoilProfile` class in `core/soil_balance.py` implements the two-step Saxton & Rawls (2006) regression equations to estimate volumetric water content at **field capacity** (θ_FC) and **permanent wilting point** (θ_WP) from sand percentage (`s`), clay percentage (`c`), and organic matter (`om`):
+
+<Steps>
+  <Step title="Field Capacity (θ_FC)">
+    A first-pass estimate is computed from the raw texture fractions, then corrected with a non-linear refinement term:
+
+    ```python
+    # From core/soil_balance.py — Saxton & Rawls θ_FC
+    fc_first = (
+        -0.251 * s + 0.195 * c + 0.011 * om + 0.006 * s * om
+        - 0.027 * c * om + 0.452 * s * c + 0.299
+    )
+    self.theta_fc = fc_first + (1.283 * fc_first**2 - 0.374 * fc_first - 0.015)
+    ```
+
+    Where `s = sand_pct / 100`, `c = clay_pct / 100`, and `om = om_pct` (as a percentage, not a fraction).
+  </Step>
+  <Step title="Wilting Point (θ_WP)">
+    The same two-step structure is applied with different regression coefficients:
+
+    ```python
+    # From core/soil_balance.py — Saxton & Rawls θ_WP
+    wp_first = (
+        -0.024 * s + 0.487 * c + 0.006 * om + 0.005 * s * om
+        - 0.013 * c * om + 0.068 * s * c + 0.031
+    )
+    self.theta_wp = wp_first + (0.14 * wp_first - 0.02)
+    ```
+
+    θ_WP is the soil moisture threshold below which plants can no longer extract water; any soil moisture below this value contributes zero to transpiration.
+  </Step>
+</Steps>
+
+Both outputs are **dimensionless volumetric fractions** (m³ water / m³ soil). For the default Jutiapa profile (clay 26%, sand 52%, OM 1.8%) these equations yield values consistent with typical Sandy Clay Loam hydraulic properties documented in FAO Irrigation Paper No. 56 (Allen et al., 1998).
+
+## Derived Water Metrics
+
+From θ_FC, θ_WP, and the effective rooting depth, `SoilProfile` computes three operational water metrics:
+
+<CardGroup cols={3}>
+  <Card title="TAW" icon="droplet">
+    **Total Available Water** (mm)
+
+    The maximum water volume the crop root zone can hold between field capacity and wilting point:
+
+    `TAW = (θ_FC − θ_WP) × root_depth_mm`
+
+    Crop root depth is **600 mm** during the simulation window (`crop_root_mm`). A shallower fallow-state depth of **400 mm** (`fallow_root_mm`) is used for the antecedent soil moisture bucket.
+  </Card>
+  <Card title="RAW" icon="water">
+    **Readily Available Water** (mm)
+
+    The fraction of TAW extractable without inducing stomatal stress:
+
+    `RAW = p_depletion × TAW`
+
+    With `p_depletion = 0.55`, RAW represents 55% of TAW — consistent with maize's moderate drought sensitivity during vegetative stages under FAO-56 guidelines.
+  </Card>
+  <Card title="p_depletion" icon="chart-line">
+    **Depletion Fraction**
+
+    Fixed at **0.55** for white maize in the Dry Corridor (`SoilConfig.p_depletion`). This value indicates that the crop begins to experience water stress once 55% of TAW has been depleted. Values range from 0.30 (stress-sensitive crops) to 0.65 (drought-tolerant crops).
+  </Card>
+</CardGroup>
+
+## FAO-56 Bucket Simulation
+
+The core hydrological engine is implemented as a **continuous bucket model** (`bucket_series` and `simulate_window` in `core/soil_balance.py`). Each daily time step applies the following water balance equation:
+
+```text
+S[t+1] = clamp( S[t] + P[t] − Kc[t] × ET₀[t] × Kₛ[t], 0, TAW )
+```
+
+where:
+
+- **S** = current soil water storage (mm)
+- **P** = daily precipitation (mm)
+- **Kc[t]** = crop coefficient at day *t* (interpolated from the Kc curve)
+- **ET₀** = Penman-Monteith reference evapotranspiration (mm/day) from ERA5
+- **Kₛ** = dimensionless water stress factor (FAO-56 Eq. 84)
+
+**Water stress factor Kₛ** is computed daily based on current depletion:
+
+```python
+# From core/soil_balance.py — FAO-56 Ks calculation
+ks = 1.0 if (taw - s) <= raw else min(1.0, max(0.0, s / max(taw - raw, 1e-6)))
+```
+
+When the soil water depletion does not exceed RAW (`taw − s ≤ raw`), no stress is applied and `Kₛ = 1.0`. Once depletion exceeds RAW, `Kₛ` declines linearly toward zero as the soil approaches the wilting point.
+
+**Waterlogging detection** is triggered whenever the daily precipitation surplus exceeds `excess_mm_day = 15.0 mm/day` after the bucket is already full (S would exceed TAW):
+
+```python
+# From core/soil_balance.py — waterlogging counter
+if s > taw:
+    if (s - taw) >= agro_cfg.excess_mm_day:   # 15.0 mm/day threshold
+        waterlog_count += 1
+    s = taw
+```
+
+Each day where the surplus exceeds 15 mm after saturation increments the waterlogging counter. This counter is compared against `waterlog_max_days = 8` to generate the binary waterlogging failure label.
+
+## Crop Coefficient (Kc) Curve
+
+The 60-day Kc curve for white maize is defined by three anchor points that are linearly interpolated using `numpy.interp`:
+
+| Day | Kc Value | Growth Phase |
+|---|---|---|
+| 0 | 0.30 | Initial / bare soil |
+| 20 | 0.30 | Establishment plateau |
+| 60 | 1.15 | Flowering / peak transpiration |
+
+```python
+# From config/settings.py — AgroConfig.kc_curve property
+@property
+def kc_curve(self) -> np.ndarray:
+    return np.interp(
+        np.arange(1, self.window_days + 1),   # Days 1–60
+        list(self.kc_days_points),             # (0, 20, 60)
+        list(self.kc_values_points)            # (0.30, 0.30, 1.15)
+    )
+```
+
+The Kc rises steeply after day 20 to reflect canopy closure and the rapid increase in leaf area index during vegetative development, reaching its peak of 1.15 at day 60 — the end of the simulation window and the approximate onset of flowering in the Jutiapa climate.
+
+<Tip>
+  The 60-day simulation window (`window_days = 60`) covers crop establishment through early flowering. The full 120-day phenological cycle (including grain fill and maturation) is evaluated separately by the `rain_streak_analyzer` module, which uses the raw precipitation series rather than the water balance model.
+</Tip>
+
+## Viability Thresholds
+
+A sowing date is labeled **viable (target = 1)** in the training dataset only when both of the following conditions are satisfied over the 60-day simulation window. If either condition fails, the label is **fracaso (target = 0)**:
+
+<CardGroup cols={2}>
+  <Card title="Minimum ETa/ETc Ratio" icon="circle-check">
+    **`eta_etc_min = 0.90`**
+
+    The ratio of actual evapotranspiration (ETa) to crop evapotranspiration (ETc) must be **≥ 0.90** over the full 60-day window. This means the crop must achieve at least 90% of its potential water uptake — a threshold that corresponds to less than 10% yield reduction from drought stress under the standard FAO-56 framework.
+
+    A sowing date where ETa/ETc < 0.90 is flagged as `fallo_sequia = True`.
+  </Card>
+  <Card title="Maximum Waterlogging Days" icon="circle-xmark">
+    **`waterlog_max_days = 8`**
+
+    The number of days with excess waterlogging (daily surplus ≥ 15 mm after saturation) must not exceed **8 days** in the 60-day window. Maize roots begin to suffer irreversible anoxia after approximately 3–4 consecutive days of saturation; 8 total days across the window is the empirical tolerance threshold for Jutiapa's soil drainage conditions.
+
+    A sowing date where waterlogging days > 8 is flagged as `fallo_exceso = True`.
+  </Card>
+</CardGroup>
+
+The binary training label is then:
+
+```python
+# From core/soil_balance.py — target label construction
+df["target"] = np.where(
+    df["eta_etc"].notna(),
+    (~df["fallo_sequia"] & ~df["fallo_exceso"]).astype(float),
+    np.nan
+)
+```
+
+Rows where the simulation window extends beyond the available ERA5 data (future dates or dates within 60 days of the series end) receive `target = NaN` and are excluded from model training.

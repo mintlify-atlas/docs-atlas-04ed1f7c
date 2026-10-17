@@ -1,20 +1,74 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "AGRO-JUTIAPA: Agricultural Viability Platform"
+sidebarTitle: "Home"
+description: "Open-access agrometeorological and financial viability system for white maize sowing in Calderas, San José Acatempa, Jutiapa, Guatemala."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+AGRO-JUTIAPA is an open-access platform that combines 45 years of ERA5 satellite climate reanalysis, FAO-56 soil water balance physics, and calibrated XGBoost machine learning to give farmers in the Guatemalan Dry Corridor a data-driven sowing viability verdict — no login or account required.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="seedling" href="/introduction">
+    Learn what AGRO-JUTIAPA does and how the system is structured
+  </Card>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Run your first analysis in under five minutes
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Integrate the REST endpoints into your own applications
+  </Card>
+  <Card title="CLI Guide" icon="terminal" href="/guides/cli">
+    Run headless analyses from the command line
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## What AGRO-JUTIAPA Does
+
+Every time a farmer submits a planting date and parcel dimensions, the platform:
+
+<Steps>
+  <Step title="Downloads live climate data">
+    Fetches daily precipitation, reference evapotranspiration (ET₀), and mean temperature from the Open-Meteo ERA5 Archive API (1981 – present), plus ENSO indices (MEI v2, Niño 3.4) from NOAA PSL.
+  </Step>
+  <Step title="Simulates soil water balance">
+    Runs a continuous FAO-56 bucket model using Saxton & Rawls pedotransfer equations calibrated for Jutiapa's soil profile (26% clay, 52% sand, 1.8% organic matter).
+  </Step>
+  <Step title="Infers viability probability">
+    Applies a calibrated XGBoost / Logistic Regression ensemble (temporal GroupKFold CV, Brier Skill Score validated) to return a probability score from 0 to 100%.
+  </Step>
+  <Step title="Delivers a tri-color verdict">
+    Maps the probability to a Green / Yellow / Red traffic light, a phenological rain streak analysis across 120 crop days, and a full P&L financial projection using real-time MAGA wholesale prices.
+  </Step>
+</Steps>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="ERA5 Climate Reanalysis" icon="cloud-sun-rain">
+    45 years of daily satellite reanalysis data with automatic local caching and exponential-backoff retries.
+  </Card>
+  <Card title="FAO-56 Soil Balance" icon="droplet">
+    Continuous bucket simulation tracking soil moisture fraction, water stress coefficient Kₛ, and waterlogging days.
+  </Card>
+  <Card title="XGBoost + Logit Ensemble" icon="brain">
+    Four model configurations compared via AUC and Brier Skill Score; best model selected and sigmoid-calibrated automatically.
+  </Card>
+  <Card title="Traffic Light System" icon="traffic-light">
+    Green ≥ 60%, Yellow 35–59%, Red &lt; 35% — with ENSO phase context and actionable recommendations.
+  </Card>
+  <Card title="120-Day Fenology Analysis" icon="chart-line">
+    Stage-by-stage rain streak analysis (germination → vegetative → flowering → grain fill) with canícula detection.
+  </Card>
+  <Card title="Real-Time MAGA Prices" icon="chart-bar">
+    Live wholesale maize price scraper from Guatemala's official MAGA market portal for accurate P&L projections.
+  </Card>
+  <Card title="Terrain Geometry" icon="vector-square">
+    CAD-style area calculation for rectangular, triangular, and irregular quadrilateral parcels in m², manzanas, and hectares.
+  </Card>
+  <Card title="PDF Report Export" icon="file-pdf">
+    Three-page official technical dictum with water balance charts, terrain layout, and financial summary.
+  </Card>
+</CardGroup>
+
+<Note>
+  AGRO-JUTIAPA is calibrated exclusively for **Calderas, San José Acatempa, Jutiapa, Guatemala** (Lat 14.240–14.290, Lon −90.160–−90.110). Requests outside this bounding box are rejected.
+</Note>

@@ -1,0 +1,266 @@
+---
+title: "Rain Streak and Phenological Analysis for 120-Day Crop Cycle"
+sidebarTitle: "Rain Streak Analyzer"
+description: "core/rain_streak_analyzer.py analyzes daily rainfall across the four maize phenological stages, detects the canícula dry spell, and generates critical alerts for the traffic light system."
+---
+
+`core/rain_streak_analyzer.py` provides phenology-aware rainfall analysis designed specifically for white maize production in the Dry Corridor of Guatemala. Given exactly 120 days of daily rainfall values, it evaluates each of the four maize phenological stages against empirically calibrated thresholds, detects the intra-estival canícula dry spell typical of Jutiapa's July–August climate, computes a weighted risk score, and issues blocking critical alerts that can override the ML traffic-light verdict when hydrological conditions are lethal to the crop. This module is the final gate in the pipeline before generating the PDF report.
+
+---
+
+## `analyze_rain_streaks()` Function
+
+```python
+def analyze_rain_streaks(
+    daily_rain_mm: List[float],
+    sowing_date: str,
+) -> RainStreakReport
+```
+
+The primary entry point. Accepts exactly 120 daily rainfall values (real observed data or day-of-year climatological medians for future dates) and returns a `RainStreakReport` with full per-stage diagnostics, canícula detection, and an overall sowing verdict.
+
+<ParamField path="daily_rain_mm" type="List[float]">
+  List or array of at least 120 non-negative daily rainfall values in mm. Values are sanitised to `max(0.0, v)` and `NaN` entries are replaced with `0.0`. A `ValueError` is raised if fewer than 120 values are provided.
+</ParamField>
+
+<ParamField path="sowing_date" type="str">
+  ISO-8601 sowing date string (`"YYYY-MM-DD"`). Used to map cycle days to calendar months for canícula detection (months 7 and 8 in Jutiapa's climate).
+</ParamField>
+
+**Returns:** `RainStreakReport`
+
+<Warning>
+  The function raises `ValueError` if `daily_rain_mm` contains fewer than 120 elements. Always ensure the series is padded or synthesised to exactly 120 days before calling.
+</Warning>
+
+---
+
+## `RainStreakReport` Dataclass
+
+`RainStreakReport` is the top-level result object returned by `analyze_rain_streaks()`.
+
+<ResponseField name="overall_verdict" type="str">
+  Overall sowing recommendation based on aggregated phenological risk:
+
+  - `"APTO PARA SIEMBRA"` — no critical alerts, all stages at low/moderate risk, risk score ≥ 0.75.
+  - `"SIEMBRA CON PRECAUCIÓN"` — at least one stage at high risk, or moderate canícula, or risk score in [0.50, 0.75).
+  - `"NO APTO PARA SIEMBRA"` — one or more critical alerts, any stage at Crítico risk level, or risk score < 0.50.
+</ResponseField>
+
+<ResponseField name="overall_risk_score" type="float">
+  Composite risk score in `[0.0, 1.0]` where **1.0 = optimal** and **0.0 = worst**. Computed as a weighted sum of per-stage scores (Floración carries 40% weight as the most critical stage) minus penalties for canícula severity, distribution quality, and critical alert count.
+</ResponseField>
+
+<ResponseField name="stages" type="List[StageAnalysis]">
+  List of four `StageAnalysis` objects, one per phenological stage, in chronological order (Germinación → Desarrollo Vegetativo → Floración → Llenado de Grano).
+</ResponseField>
+
+<ResponseField name="critical_alerts" type="List[str]">
+  Blocking alert messages that indicate lethal or near-lethal hydrological conditions. The pipeline caps `probabilidad` at 0.35 and forces the traffic light to Rojo if this list is non-empty.
+</ResponseField>
+
+<ResponseField name="canicula_detected" type="bool">
+  `True` when a significant intra-estival dry spell was detected in the July–August window (or the mid-cycle window for non-standard sowing dates).
+</ResponseField>
+
+<ResponseField name="canicula_severity" type="str">
+  Severity classification based on the longest consecutive dry streak (< 1.5 mm/day) in the canícula window:
+
+  - `"Ninguna"` — streak < 5 days
+  - `"Leve"` — 5–8 days
+  - `"Moderada"` — 9–14 days
+  - `"Severa"` — ≥ 15 days (adds a critical alert)
+</ResponseField>
+
+<ResponseField name="canicula_days" type="int">
+  Length in days of the longest dry streak detected in the canícula window.
+</ResponseField>
+
+<ResponseField name="total_cycle_rain_mm" type="float">
+  Total precipitation accumulated across all 120 days of the cycle (mm). Values below 300 mm trigger an additional critical alert; the recommended minimum for commercial white maize in the Dry Corridor is 400 mm.
+</ResponseField>
+
+<ResponseField name="rain_distribution_quality" type="str">
+  Overall temporal distribution quality:
+
+  - `"Buena"` — no severe adequacy failures, all stages at low/moderate risk.
+  - `"Irregular"` — at least one stage with moderate excess or deficit.
+  - `"Deficiente"` — ≥ 2 stages with severe adequacy failures, or the flowering stage has a severe failure, or total rain is < 350 mm or > 850 mm, or critical alerts exist.
+</ResponseField>
+
+---
+
+## `StageAnalysis` Dataclass
+
+`StageAnalysis` contains the detailed agronomic diagnosis for one phenological stage. All four stages in `RainStreakReport.stages` use this structure.
+
+<ResponseField name="stage_name" type="str">
+  Stage name in Spanish: `"Germinación y Emergencia"`, `"Desarrollo Vegetativo"`, `"Floración y Polinización"`, or `"Llenado de Grano"`.
+</ResponseField>
+
+<ResponseField name="stage_days" type="str">
+  Day range string, e.g. `"Días 1-15"`, `"Días 16-55"`, `"Días 56-75"`, `"Días 76-120"`.
+</ResponseField>
+
+<ResponseField name="total_rain_mm" type="float">
+  Total precipitation accumulated during the stage (mm).
+</ResponseField>
+
+<ResponseField name="avg_daily_rain_mm" type="float">
+  Average daily precipitation during the stage (mm/day).
+</ResponseField>
+
+<ResponseField name="max_consecutive_dry_days" type="int">
+  Length of the longest consecutive dry streak (< 1.5 mm/day) within the stage.
+</ResponseField>
+
+<ResponseField name="max_consecutive_wet_days" type="int">
+  Length of the longest consecutive wet streak (> 15.0 mm/day) within the stage.
+</ResponseField>
+
+<ResponseField name="rain_adequacy" type="str">
+  Adequacy classification compared to the stage's water requirement range:
+
+  - `"Déficit Severo"` — total < 60% of minimum requirement
+  - `"Déficit Moderado"` — total in [60%, 100%) of minimum
+  - `"Adecuado"` — total within [minimum, maximum] range
+  - `"Exceso Moderado"` — total in (maximum, 140% of maximum]
+  - `"Exceso Severo"` — total > 140% of maximum
+</ResponseField>
+
+<ResponseField name="risk_level" type="str">
+  Overall risk classification: `"Bajo"`, `"Moderado"`, `"Alto"`, or `"Crítico"`. Feeds the weighted risk score calculation.
+</ResponseField>
+
+<ResponseField name="issues" type="List[str]">
+  List of agronomic problem descriptions identified during the stage. Empty list if conditions are adequate.
+</ResponseField>
+
+<ResponseField name="recommendations" type="List[str]">
+  List of specific management directives tailored to the identified issues and the local conditions of Calderas, San José Acatempa.
+</ResponseField>
+
+---
+
+## Phenological Stages
+
+The four stages represent the complete biological cycle of white maize (*Zea mays* L.) under the climatic conditions of Calderas, Jutiapa, Guatemala. Thresholds are calibrated from 45 years of ERA5 reanalysis data combined with MAGA agronomic standards for the Corredor Seco.
+
+| Stage | Days | Water Requirement | Critical Failure Condition |
+|-------|------|-------------------|---------------------------|
+| Germinación y Emergencia | 1–15 | 20–40 mm | > 5 consecutive days > 15 mm/day (seed rot) OR > 7 consecutive days < 1 mm/day (embryo desiccation) |
+| Desarrollo Vegetativo | 16–55 | 150–250 mm | > 8 consecutive days > 20 mm/day (root asphyxia) OR > 10 consecutive days < 1.5 mm/day (stunting) |
+| Floración y Polinización | 56–75 | 80–120 mm | > 4 consecutive days < 2 mm/day (pollen desiccation, 6–10% yield loss per day) OR > 6 consecutive days > 25 mm/day (pollen wash-off) |
+| Llenado de Grano | 76–120 | 150–250 mm | > 6 consecutive days < 1.5 mm/day in days 76–95 (kernel abortion); > 10 consecutive days > 15 mm/day triggers rot warning |
+
+<Warning>
+  The **Floración y Polinización** stage (days 56–75) carries the highest risk weight (40%) in the composite score calculation. A severe dry spell during this stage alone can produce a `"NO APTO PARA SIEMBRA"` verdict even if all other stages are favourable.
+</Warning>
+
+### Risk Score Weights
+
+```python
+risk_weights = {
+    "Germinación y Emergencia": 0.15,
+    "Desarrollo Vegetativo":    0.25,
+    "Floración y Polinización": 0.40,  # Most critical stage
+    "Llenado de Grano":         0.20,
+}
+score_by_level = {
+    "Bajo":    1.00,
+    "Moderado": 0.70,
+    "Alto":    0.35,
+    "Crítico": 0.05,
+}
+```
+
+The base score is then penalised by canícula severity (−0.05 Leve, −0.10 Moderada, −0.20 Severa), distribution quality (−0.05 Irregular, −0.15 Deficiente), and critical alerts (−0.12 per alert, capped at −0.35).
+
+---
+
+## `generate_streak_pdf_section()` Function
+
+```python
+def generate_streak_pdf_section(report: RainStreakReport) -> Dict[str, Any]
+```
+
+Converts a `RainStreakReport` into a fully serialisable dictionary suitable for inclusion in the PDF report and for JSON responses from the web API.
+
+<ParamField path="report" type="RainStreakReport">
+  Completed `RainStreakReport` instance returned by `analyze_rain_streaks()`.
+</ParamField>
+
+**Returns:** `Dict[str, Any]` with the following top-level keys:
+
+<Expandable title="Output keys">
+  <ResponseField name="titulo / subtitulo" type="str">
+    Section heading and subheading for the PDF report.
+  </ResponseField>
+  <ResponseField name="veredicto_general" type="str">
+    The overall sowing verdict string.
+  </ResponseField>
+  <ResponseField name="puntaje_riesgo" type="float">
+    Numeric risk score (0.0–1.0).
+  </ResponseField>
+  <ResponseField name="puntaje_riesgo_pct" type="str">
+    Risk score formatted as a percentage string (e.g. `"78.5%"`).
+  </ResponseField>
+  <ResponseField name="calidad_distribucion" type="str">
+    Rain distribution quality label.
+  </ResponseField>
+  <ResponseField name="total_precipitacion_ciclo_mm" type="str">
+    Total cycle precipitation formatted as `"XXX.X mm"`.
+  </ResponseField>
+  <ResponseField name="alertas_criticas" type="List[str]">
+    List of critical alert messages.
+  </ResponseField>
+  <ResponseField name="tiene_alertas_criticas" type="bool">
+    Convenience boolean indicating whether any critical alerts were raised.
+  </ResponseField>
+  <ResponseField name="canicula" type="Dict">
+    Nested dict with keys `detectada`, `severidad`, `dias_duracion`, `diagnostico`.
+  </ResponseField>
+  <ResponseField name="tabla_etapas" type="List[Dict]">
+    Per-stage summary rows suitable for table rendering. Each dict contains `etapa`, `dias`, `lluvia_total`, `promedio_diario`, `racha_seca_max`, `racha_humeda_max`, `adecuacion`, `nivel_riesgo`, `problemas`, and `recomendaciones`.
+  </ResponseField>
+  <ResponseField name="resumen_ejecutivo" type="str">
+    Narrative executive summary paragraph calibrated to the verdict and Dry Corridor context.
+  </ResponseField>
+  <ResponseField name="directiva_agronomica" type="str">
+    Final management directive: proceed, apply mitigation measures, or do not sow.
+  </ResponseField>
+</Expandable>
+
+---
+
+## Usage Example
+
+```python
+from core.rain_streak_analyzer import analyze_rain_streaks, generate_streak_pdf_section
+
+# 120 daily rainfall values (mm)
+daily_rain = [0.0] * 10 + [5.2, 8.1, 3.4] + [2.0] * 107
+report = analyze_rain_streaks(daily_rain, "2026-06-01")
+
+print(f"Verdict: {report.overall_verdict}")
+print(f"Risk score: {report.overall_risk_score:.2f}")
+print(f"Canícula detected: {report.canicula_detected} ({report.canicula_severity})")
+for stage in report.stages:
+    print(f"  {stage.stage_name}: {stage.risk_level} risk, {stage.total_rain_mm:.1f}mm total")
+```
+
+To obtain the serialisable dict for the PDF or JSON API:
+
+```python
+section = generate_streak_pdf_section(report)
+print(section["veredicto_general"])
+print(section["resumen_ejecutivo"])
+
+# Iterate the stage table
+for row in section["tabla_etapas"]:
+    print(f"{row['etapa']:35s}  {row['nivel_riesgo']:10s}  {row['lluvia_total']}")
+```
+
+<Note>
+  The `analyze_rain_streaks()` function is also the foundation for the historical batch analysis function `analyze_historical_streaks()`, which runs the same logic across every year in the ERA5 record for a given sowing month and returns aggregate statistics such as the percentage of years with canícula, average dry streak length, and historical viability rate.
+</Note>
