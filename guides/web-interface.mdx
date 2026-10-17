@@ -1,7 +1,7 @@
 ---
-title: "Using the AGRO-JUTIAPA Web Interface"
+title: "AGRO-JUTIAPA Web Interface: Step-by-Step Usage Guide"
 sidebarTitle: "Web Interface"
-description: "Step-by-step guide to using the AGRO-JUTIAPA single-page web app: entering parcel dimensions, setting the sowing date, reading the traffic light, and downloading the PDF report."
+description: "Step-by-step guide to the AGRO-JUTIAPA SPA: configure parcel geometry, set the sowing date, read the traffic-light verdict, and download the PDF report."
 ---
 
 AGRO-JUTIAPA ships a fully self-contained single-page application (SPA) located at `front/index.html`. The front-end is orchestrated by `front/js/app.js`, which wires together reactive form validation, real-time API calls, an interactive CAD canvas (`front/js/terrain.js`), dynamic Chart.js water-balance charts (`front/js/charts.js`), and an in-browser PDF viewer powered by `html2pdf.bundle.min.js`. No build step or bundler is required — the SPA runs directly from the file system when served by the included Python server.
@@ -88,8 +88,8 @@ The most prominent result is the tri-color traffic light, which summarizes the c
 
 | Color | Spanish label | Threshold | Meaning |
 |---|---|---|---|
-| 🟢 Verde | RECOMENDADO PARA SIEMBRA | ≥ 70 % | Hydrological conditions are highly favorable. Proceed with scheduled sowing. |
-| 🟡 Amarillo | SIEMBRA CONDICIONADA | 40 %–69 % | Moderate water risk. Use early or drought-tolerant varieties and conservation tillage. |
+| 🟢 Verde | RECOMENDADO PARA SIEMBRA | ≥ 80 % | Hydrological conditions are highly favorable. Proceed with scheduled sowing. |
+| 🟡 Amarillo | SIEMBRA CONDICIONADA | 40 %–79 % | Moderate water risk. Use early or drought-tolerant varieties and conservation tillage. |
 | 🔴 Rojo | NO SEMBRAR | < 40 % | High probability of critical water stress or phenological failure. Do not sow. |
 
 Directly below the semáforo you will see:
@@ -132,7 +132,7 @@ The interface includes an interactive PDF viewer that lets you review the offici
   </Step>
 </Steps>
 
-The PDF is structured in **three pages** in Letter format:
+The PDF is structured in **three pages** in A4 format:
 
 1. **Page 1 — Dictamen Técnico:** Semáforo verdict, calibrated probability, ENSO phase, algorithmic criteria, historical ex-post validation, phenological streak report, and the full P&L financial projection with sensitivity matrix.
 2. **Page 2 — Balance Hídrico:** The water balance chart exported as a high-resolution image (`output/balance_hidrico_siembra.png`).

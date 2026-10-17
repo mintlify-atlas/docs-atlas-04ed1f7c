@@ -1,7 +1,7 @@
 ---
-title: "ERA5 Weather and NOAA ENSO Data Fetching"
+title: "ERA5 Weather and NOAA ENSO Data Fetching for AGRO-JUTIAPA"
 sidebarTitle: "Data Fetcher"
-description: "core/data_fetcher.py downloads daily ERA5 climate data from Open-Meteo and ENSO indices from NOAA PSL, with local disk caching and exponential-backoff retry logic."
+description: "core/data_fetcher.py downloads daily ERA5 climate data and monthly NOAA ENSO indices with file-based caching and exponential-backoff retry for Open-Meteo."
 ---
 
 `core/data_fetcher.py` is the data acquisition layer of the AGRO-JUTIAPA platform. It provides two primary download functions — `fetch_weather()` for daily ERA5 reanalysis data from Open-Meteo and `fetch_macro()` for monthly ENSO indices from NOAA PSL — plus the MAGA official maize price scraper `fetch_maga_white_corn_price()` from `core/maga_scraper.py`. Both weather and macro functions implement file-based disk caching and automatic exponential-backoff retry logic to handle rate-limiting and transient network errors gracefully.
@@ -148,13 +148,13 @@ NOAA PSL requests are made with a single 40-second `requests.get()` call without
 Defined in `core/maga_scraper.py`, this function is called by the pipeline immediately before each financial projection to inject a live official maize price.
 
 ```python
-def fetch_maga_white_corn_price(timeout_sec: int = 3) -> Dict[str, Any]
+def fetch_maga_white_corn_price(timeout_sec: int = 6) -> Dict[str, Any]
 ```
 
 Scrapes the official MAGA daily price page (`https://precios.maga.gob.gt/diarios/diarios.html`) for the current price of *Maíz blanco, de primera* at Mercado La Terminal. Results are cached in a module-level dict for 10 minutes (`ttl_seconds=600`) to avoid saturating the MAGA server across parallel requests.
 
-<ParamField path="timeout_sec" type="int" default="3">
-  HTTP request timeout in seconds. The pipeline passes `3` to avoid blocking the analysis if the MAGA server is slow. Increase this value if you observe fallback prices being returned during periods of high MAGA server load.
+<ParamField path="timeout_sec" type="int" default="6">
+  HTTP request timeout in seconds. The module default is `6`; the pipeline overrides this to `3` when calling from `run()` to avoid blocking the analysis if the MAGA server is slow. Increase this value if you observe fallback prices being returned during periods of high MAGA server load.
 </ParamField>
 
 **Returns:** `Dict[str, Any]` with the following keys:

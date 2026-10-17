@@ -1,7 +1,7 @@
 ---
-title: "GET /api/maga-price — Real-Time MAGA Corn Price"
-sidebarTitle: "GET /api/maga-price"
-description: "GET /api/maga-price scrapes the official MAGA Guatemala wholesale corn price from La Terminal market in real time, with a 10-minute cache and Q 235.00 fallback."
+title: "GET /api/maga-price — Live MAGA Wholesale Corn Price"
+sidebarTitle: "MAGA Price"
+description: "Scrapes MAGA Guatemala live wholesale price for Maíz blanco at La Terminal. Cached 10 minutes; returns Q 235.00 fallback when the portal is unreachable."
 ---
 
 `GET /api/maga-price` delivers the current official wholesale price of *Maíz blanco, de primera* at the La Terminal market in Guatemala City, scraped in real time from the Ministerio de Agricultura, Ganadería y Alimentación (MAGA) public price portal. The price is used internally by `POST /api/analyze` to anchor the P&L projection, but is also exposed as a standalone endpoint for any client that needs the live price directly — no authentication, no API key, and no query parameters required.

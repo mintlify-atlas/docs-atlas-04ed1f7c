@@ -1,7 +1,7 @@
 ---
 title: "AgroViabilityPipeline: Orchestrating the Full Analysis"
 sidebarTitle: "Pipeline"
-description: "AgroViabilityPipeline.run() executes all five analysis steps — data download, soil balance, model CV, inference, and PDF generation — and returns a PipelineResult dataclass."
+description: "AgroViabilityPipeline.run() orchestrates ten steps: ERA5 download, FAO-56 soil balance, GroupKFold CV, ENSO inference, terrain, finances, and PDF export."
 ---
 
 `AgroViabilityPipeline` is the central orchestrator of the AGRO-JUTIAPA platform. A single call to `run()` coordinates every subsystem — ERA5 climate acquisition, FAO-56 soil water balance, GroupKFold cross-validation, ENSO-aware inference, terrain geometry, financial projection, rain streak phenological analysis, and PDF export — and returns a fully populated `PipelineResult` dataclass. The pipeline is designed for both one-shot CLI execution and low-latency web-server deployments, using an in-memory model cache to avoid redundant computation across repeated requests for the same geographic location.

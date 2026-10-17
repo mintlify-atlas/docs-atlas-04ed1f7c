@@ -1,7 +1,7 @@
 ---
 title: "Rain Streak and Phenological Analysis for 120-Day Crop Cycle"
 sidebarTitle: "Rain Streak Analyzer"
-description: "core/rain_streak_analyzer.py analyzes daily rainfall across the four maize phenological stages, detects the canícula dry spell, and generates critical alerts for the traffic light system."
+description: "core/rain_streak_analyzer.py evaluates 120-day rainfall across four maize phenological stages, detects canícula dry spells, and issues critical alerts."
 ---
 
 `core/rain_streak_analyzer.py` provides phenology-aware rainfall analysis designed specifically for white maize production in the Dry Corridor of Guatemala. Given exactly 120 days of daily rainfall values, it evaluates each of the four maize phenological stages against empirically calibrated thresholds, detects the intra-estival canícula dry spell typical of Jutiapa's July–August climate, computes a weighted risk score, and issues blocking critical alerts that can override the ML traffic-light verdict when hydrological conditions are lethal to the crop. This module is the final gate in the pipeline before generating the PDF report.

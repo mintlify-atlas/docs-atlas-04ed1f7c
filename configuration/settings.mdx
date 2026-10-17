@@ -1,7 +1,7 @@
 ---
 title: "Configuration Reference: Dataclasses and Global Settings"
 sidebarTitle: "Settings"
-description: "Complete reference for all configuration dataclasses in config/settings.py: GeoConfig, AgroConfig, SoilConfig, MacroClimateConfig, MagaPriceConfig, SemaforoConfig, and PathConfig."
+description: "Default values for every frozen dataclass in config/settings.py — GeoConfig, AgroConfig, SoilConfig, MagaPriceConfig, SemaforoConfig, and ValidationConfig."
 ---
 
 `config/settings.py` is the single source of truth for every tunable parameter in the AGRO-JUTIAPA platform. All parameters are grouped into purpose-specific **frozen dataclasses** — once instantiated, their fields are immutable. Each dataclass has a corresponding **global singleton** (`GEO_CONFIG`, `AGRO_CONFIG`, `SOIL_CONFIG`, `MACRO_CONFIG`, `MAGA_CONFIG`, `SEMAFORO_CONFIG`, `VALIDATION_CONFIG`, `PATH_CONFIG`) that the pipeline uses by default. You can override any subset of parameters by constructing a new dataclass instance and passing it to the pipeline — the rest of this page covers every field and its default value.

@@ -1,7 +1,7 @@
 ---
 title: "Running Headless Analyses with the AGRO-JUTIAPA CLI"
 sidebarTitle: "CLI"
-description: "Full reference for python main.py — every argument, default value, and example for running batch analyses, forcing cache refresh, and skipping PDF generation."
+description: "Full reference for python main.py: every argument, default value, and usage example for batch analyses, cache refresh, and headless PDF-free operation."
 ---
 
 `main.py` exposes the full AGRO-JUTIAPA pipeline as a headless command-line interface, making it suitable for automation scripts, CI/CD pipelines, batch analysis of multiple sowing dates, and server-side scheduled jobs. It accepts the same agronomic and financial parameters as the web form, executes the entire pipeline — ERA5 data ingestion, FAO-56 soil water balance, XGBoost/Logistic ensemble inference, density and P&L calculations — and prints a structured report to standard output while writing output files to the `output/` directory.
@@ -77,7 +77,7 @@ python main.py \
   --shape rectangulo \
   --width 100 \
   --length 70 \
-  --capital 7200
+  --capital 6500
 ```
 
 ```bash Force refresh, skip PDF
@@ -181,7 +181,7 @@ All files are written to the `output/` subdirectory of the project root:
 
 | File | Description |
 |---|---|
-| `output/Informe_Viabilidad_Maiz_Jutiapa.pdf` | Three-page official technical dictum (ReportLab, Letter format). Omitted if `--no-pdf` is passed. |
+| `output/Informe_Viabilidad_Maiz_Jutiapa.pdf` | Three-page official technical dictum (ReportLab, A4 format). Omitted if `--no-pdf` is passed. |
 | `output/balance_hidrico_siembra.png` | High-resolution Matplotlib chart of the 60-day water balance simulation (daily precipitation, accumulated ETc, soil moisture fraction). |
 | `output/plano_terreno.png` | Vector-quality CAD rendering of the parcel polygon with annotated side lengths and computed area. |
 | `output/calibracion_modelo.png` | Reliability diagram showing the sigmoid probability calibration curve of the XGBoost/Logistic ensemble against historical ERA5 seasons. |

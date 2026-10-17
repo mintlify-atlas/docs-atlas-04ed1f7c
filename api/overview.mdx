@@ -1,7 +1,7 @@
 ---
-title: "AGRO-JUTIAPA REST API Overview"
+title: "AGRO-JUTIAPA REST API — All Endpoints and Error Codes"
 sidebarTitle: "Overview"
-description: "Overview of the two AGRO-JUTIAPA REST endpoints: POST /api/analyze for full ML inference and GET /api/maga-price for real-time MAGA wholesale corn price scraping."
+description: "Two open-access REST endpoints for AGRO-JUTIAPA: /api/analyze runs the agroclimate pipeline and /api/maga-price returns the live MAGA corn price."
 ---
 
 AGRO-JUTIAPA exposes a lightweight REST API that powers the open-access agrometeorological and financial viability platform for white maize sowing in Calderas, San José Acatempa, Jutiapa, Guatemala. The API requires no authentication and is available both on the local multithreaded Python server (port 8000) and as Vercel Serverless Functions on your production deployment.
@@ -81,6 +81,6 @@ All error responses from both endpoints share the same JSON envelope:
 | `200` | Success — response body contains the requested data |
 | `400` | Validation error — invalid input parameter (includes `validation_error: true`) |
 | `404` | Not found — unrecognized path |
-| `405` | Method not allowed — wrong HTTP method for the endpoint |
+| `405` | Method not allowed — wrong HTTP method for the endpoint (Vercel deployment only; the local Python server does not return 405) |
 | `413` | Request body too large — exceeds the 10 KB limit on `POST /api/analyze` |
 | `500` | Internal server error — pipeline execution or scraping failure |

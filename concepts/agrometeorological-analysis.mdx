@@ -1,7 +1,7 @@
 ---
-title: "ERA5 Climate Data Ingestion and ENSO Analysis"
+title: "ERA5 Climate Data Ingestion and ENSO Analysis — Jutiapa"
 sidebarTitle: "Climate Analysis"
-description: "How AGRO-JUTIAPA fetches and processes 45 years of ERA5 reanalysis data from Open-Meteo and ENSO indices from NOAA PSL for Jutiapa, Guatemala."
+description: "How AGRO-JUTIAPA fetches 45 years of ERA5 data from Open-Meteo and ENSO indices from NOAA PSL to drive sowing recommendations for Jutiapa, Guatemala."
 ---
 
 AGRO-JUTIAPA's data pipeline forms the observational backbone of every sowing recommendation produced for Calderas, San José Acatempa, Jutiapa. On each analysis request the system fetches a continuous daily series of ERA5 satellite reanalysis data from 1981 to the present via the Open-Meteo Archive API, merges it with global macro-climate ENSO indices sourced from the NOAA Physical Sciences Laboratory, and derives a rich set of agrometeorological features before training or querying the calibrated ML models. Every step is reproducible, open-access, and requires no API key or authentication.

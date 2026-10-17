@@ -1,7 +1,7 @@
 ---
 title: "Deploy AGRO-JUTIAPA: Local Server and Vercel Serverless"
 sidebarTitle: "Deployment"
-description: "Two deployment options for AGRO-JUTIAPA: a Python multithreaded local server for production-local use, and Vercel serverless for public hosting with Node.js endpoints."
+description: "Deploy AGRO-JUTIAPA locally with Python or on Vercel serverless. Covers URL routing, 10 KB body limit, CORS headers, PDF generation, and cache persistence."
 ---
 
 AGRO-JUTIAPA ships with two ready-to-use deployment modes. The **local Python server** (`server.py`) runs the full ML pipeline, generates PDFs, and serves the SPA from a multithreaded `ThreadedHTTPServer` — ideal for on-premises installations, agricultural extension offices, or development. The **Vercel serverless deployment** exposes the same REST API surface via Node.js edge functions (`api/analyze.js` and `api/maga-price.js`), enabling zero-infrastructure public hosting at the cost of a simplified JavaScript implementation that does not include the Python ML pipeline or PDF generation.

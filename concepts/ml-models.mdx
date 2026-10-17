@@ -1,7 +1,7 @@
 ---
-title: "XGBoost and Logistic Regression Models with Temporal Cross-Validation"
+title: "XGBoost and Logistic Regression with GroupKFold Validation"
 sidebarTitle: "ML Models"
-description: "Four model configurations (XGBoost and Logistic Regression, with and without ENSO features) are validated with GroupKFold CV and compared on AUC and Brier Skill Score."
+description: "Four model configs (XGBoost and Logistic Regression, with/without ENSO) use GroupKFold temporal CV, then select the best by Brier Skill Score for Jutiapa."
 ---
 
 AGRO-JUTIAPA frames white maize sowing viability as a **binary classification problem**: given the agrometeorological conditions on a candidate sowing date, will the subsequent 60-day FAO-56 water balance yield a viable outcome (ETa/ETc ≥ 0.90, waterlogging ≤ 8 days)? Four model configurations are trained and compared on every pipeline run, using temporal cross-validation to evaluate how well each model generalizes to years it has never seen — the only meaningful test for a climate-driven prediction system. The best-performing configuration by Brier Skill Score is selected, calibrated, and used for all subsequent inference.

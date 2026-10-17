@@ -1,7 +1,7 @@
 ---
-title: "Input Validation and Security Hardening"
+title: "Input Validation and Security Hardening in AGRO-JUTIAPA"
 sidebarTitle: "Validation"
-description: "AGRO-JUTIAPA's input validator sanitizes all user inputs against SQL injection, XSS, and path traversal, and enforces geographic, financial, and geometric limits for Jutiapa."
+description: "Reference for validate_and_sanitize(): geographic bounds, financial limits, parcel geometry checks, and SQL/XSS/path-traversal hardening for Jutiapa."
 ---
 
 Every piece of user-supplied data — sowing dates, GPS coordinates, parcel dimensions, and investment capital — passes through the `validate_and_sanitize()` function in `core/input_validator.py` **before any pipeline computation begins**. The validator combines agronomic domain-knowledge checks (geographic bounding box, financial reasonableness, triangle inequality) with active security hardening (SQL injection, XSS, and path-traversal stripping). If any rule is violated, a descriptive `ValidationError` is raised immediately and no weather data is fetched. Only a successfully returned `ValidatedInput` object reaches the pipeline.
@@ -144,14 +144,22 @@ Parcel geometry is validated in two stages — per-side range checks, and then s
 
 ## String Sanitization
 
-All string inputs — including `shape_type`, `corn_type`, and `sowing_date` before numeric parsing — pass through `sanitize_string()`. The function applies **up to 5 iterative passes** to defeat nested or recursive injection payloads (e.g., `<scr<script>ipt>` or `....//`).
+All string inputs — including `shape_type`, `corn_type`, and `sowing_date` before numeric parsing — pass through `sanitize_string()`. The function first runs two pre-loop guards, then applies **up to 5 iterative passes** of four sanitization steps to defeat nested or recursive injection payloads (e.g., `<scr<script>ipt>` or `....//`).
 
-Each pass applies the following steps in order:
+**Pre-loop guards (run once before the iterative passes):**
 
 <Steps>
-  <Step title="Type and length guard">
-    Rejects any non-string value. Enforces a maximum length of `100` characters (configurable via `max_length`) to prevent denial-of-service through oversized inputs.
+  <Step title="Type guard">
+    Rejects any non-string value immediately, raising a `ValidationError` with the offending type name.
   </Step>
+  <Step title="Length guard">
+    Enforces a maximum length of `100` characters (configurable via `max_length`) to prevent denial-of-service through oversized inputs.
+  </Step>
+</Steps>
+
+**Iterative loop (up to 5 passes — exits early when a pass makes no further changes):**
+
+<Steps>
   <Step title="Script tag removal">
     Strips `<script>...</script>` blocks and their inner content using a case-insensitive, multiline regex (`(?is)<\s*script[^>]*>.*?<\s*/\s*script\s*>`).
   </Step>
@@ -166,7 +174,7 @@ Each pass applies the following steps in order:
   </Step>
 </Steps>
 
-The loop exits early as soon as a full pass produces no further changes. The final result is stripped of leading and trailing whitespace.
+The final result is stripped of leading and trailing whitespace.
 
 ---
 

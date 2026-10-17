@@ -1,7 +1,7 @@
 ---
 title: "Terrain Modeling, Sowing Density, and Financial Projection"
 sidebarTitle: "Agronomy & Economics"
-description: "core/agronomy_economics.py provides TerrainModel for parcel geometry, calculate_sowing_density() for plant population, and calculate_financial_projection() for P&L analysis."
+description: "core/agronomy_economics.py provides TerrainModel for parcel geometry, risk-adjusted sowing density, and a P&L projection from official MAGA maize prices."
 ---
 
 `core/agronomy_economics.py` covers the agronomic and economic layer of the AGRO-JUTIAPA platform. It handles three distinct concerns: (1) **terrain geometry** — computing parcel area in both metric and traditional Guatemalan units from any field measurement method; (2) **sowing density** — deriving risk-adjusted plant population, seed requirements, and row spacing from the traffic-light verdict; and (3) **financial projection** — building a complete profit-and-loss statement using official MAGA maize prices without inventing budget line items the farmer did not provide.
@@ -268,12 +268,20 @@ Three fixed scenarios are always computed alongside the projected case:
   Date of the MAGA price data used (e.g. `"09/10/2026"`).
 </ResponseField>
 
+<ResponseField name="tipo_maiz" type="str">
+  Maize type, capitalized from the `tipo_maiz` parameter (e.g. `"Blanco"`).
+</ResponseField>
+
 <ResponseField name="precio_maga_qq" type="float">
   Official MAGA price per quintal of white maize in Q.
 </ResponseField>
 
 <ResponseField name="capital_inversion_q" type="float">
   Total investment as entered by the user (Q).
+</ResponseField>
+
+<ResponseField name="area_manzanas" type="float">
+  Parcel area in Guatemalan manzanas (same as `terrain.manzanas`), included for P&L summary convenience.
 </ResponseField>
 
 <ResponseField name="rendimiento_estimado_qq_mz" type="float">

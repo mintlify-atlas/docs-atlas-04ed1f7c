@@ -1,7 +1,7 @@
 ---
 title: "POST /api/analyze — Agrometeorological Viability Analysis"
-sidebarTitle: "POST /api/analyze"
-description: "POST /api/analyze runs the full ERA5 + FAO-56 + XGBoost pipeline and returns a calibrated sowing probability, traffic light verdict, water balance timeline, and P&L projection."
+sidebarTitle: "Analyze"
+description: "Full ERA5 + FAO-56 + ML sowing viability endpoint for Calderas, Jutiapa: calibrated probability, traffic-light verdict, 60-day water balance, and P&L."
 ---
 
 `POST /api/analyze` is the core inference endpoint of AGRO-JUTIAPA. It ingests real-time meteorological observations from the Open-Meteo Live and Archive APIs (ERA5 reanalysis, 1981–present), runs a continuous FAO-56 soil-water balance calibrated for the Franco-Arcillo-Arenoso profile of Jutiapa, evaluates the result through a calibrated XGBoost/Logistic Regression ensemble trained on 45 years of ERA5 data, and returns a full agronomic and financial dossier — including a three-color traffic-light verdict, 60-day daily water balance timeline, 120-day phenological streak analysis, parcel geometry, sowing-density recommendations, and an official MAGA P&L projection — all in a single JSON response.
@@ -62,6 +62,8 @@ The request body must be a JSON object. All fields that accept defaults are opti
 
 <ParamField body="capital" type="float" default="7200.0">
   Producer's own investment capital in Guatemalan Quetzales (Q). Must be at least **Q 500.00**; requests below this threshold are rejected with HTTP 400. Valid range for meaningful financial projections: Q 500 – Q 150,000. Values above Q 25,000/mz or below Q 2,000/mz generate `capital_warnings` in the response without rejecting the request.
+
+  **Note:** The Vercel Serverless function (`api/analyze.js`) defaults to **Q 7,200** when this field is omitted. The local Python server (`server.py`) defaults to **Q 6,500**. Always supply an explicit value to ensure consistent behaviour across both runtimes.
 </ParamField>
 
 <ParamField body="corn_type" type="string" default="blanco">
@@ -138,13 +140,23 @@ curl -X POST https://your-project.vercel.app/api/analyze \
 </ResponseField>
 
 <ResponseField name="semaforo_estado" type="string">
-  Traffic-light classification label.
+  Traffic-light classification label. The exact string returned depends on which runtime handles the request.
+
+  **Vercel Serverless (`api/analyze.js`):**
 
   | Value | Threshold |
   |-------|-----------|
   | `"RECOMENDADO PARA SIEMBRA"` | probabilidad ≥ 0.70 |
   | `"SIEMBRA CONDICIONADA"` | 0.40 ≤ probabilidad < 0.70 |
-  | `"NO SEMBRAR"` | probabilidad < 0.40, or any critical alert |
+  | `"NO SEMBRAR"` | probabilidad < 0.40, or any critical phenological alert |
+
+  **Local Python server (`server.py` → `core/models.py`):**
+
+  | Value | Threshold |
+  |-------|-----------|
+  | `"ÓPTIMO"` | probabilidad ≥ 0.70 |
+  | `"CONDICIONADO O EN ALERTA"` | 0.40 ≤ probabilidad < 0.70 |
+  | `"NO SEMBRAR"` | probabilidad < 0.40 |
 </ResponseField>
 
 <ResponseField name="semaforo_color" type="string">
